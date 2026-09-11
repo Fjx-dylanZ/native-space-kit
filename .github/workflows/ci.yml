@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check:
+    name: Build and read-only checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcrun --sdk macosx --show-sdk-version
+          xcrun clang --version
+          python3 --version
+
+      - name: Build library and CLI
+        run: make
+
+      - name: Build pure-C example
+        run: make example
+
+      - name: Build probe helpers
+        run: make probes
+
+      # Read-only. The contract and CLI tests skip their live queries when the
+      # runner has no GUI session or the private entry points are absent on
+      # that macOS release; nothing here submits a native write.
+      - name: Contract, CLI, and probe-safety checks
+        run: make check
+
+      - name: Report runtime capabilities on this runner
+        run: build/nsk capabilities || true

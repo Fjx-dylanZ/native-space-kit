@@ -1,0 +1,24 @@
+# Build output
+build/
+*.o
+*.a
+*.dSYM/
+
+# Python caches from tests/ and probes/
+__pycache__/
+*.pyc
+
+# macOS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor and IDE state
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local probe reports (python3 probes/*.py --report PATH); machine-specific
+*.report.json
