@@ -62,6 +62,39 @@ build/nsk destroy SPACE_ID --migrate
 
 Replace the uppercase arguments with IDs returned by queries. **A native Space ID is not a Desktop number.** `index` is the current one-based global position; `display_index` is one-based within the owning display. Neither is a persistent identity.
 
+### Selecting a Space on multiple displays
+
+First run `build/nsk list` to find the opaque `display` string for the intended
+screen. Use that exact string, quoted, to narrow a fresh census:
+
+```sh
+build/nsk list --display DISPLAY
+build/nsk list --display DISPLAY --display-index 2
+```
+
+`--display-index` requires `--display`; a bare "Desktop 2" is ambiguous across
+screens. It selects the second **Space record** on that display, which may not
+be an ordinary Desktop if fullscreen Spaces are present. Check `type == 0`
+before choosing a Desktop for a window move. Filters preserve the original
+`index` and `display_index` values and the `{"spaces":[...]}` response shape.
+An absent display or index returns `not_found` with exit 1, never a fallback to
+another screen. Existing unfiltered `list` output is unchanged.
+
+Use the selected record's native `id` in mutation commands. These read-only
+selectors do not bind a later write to a topology snapshot: after unplugging a
+display, reordering Spaces, or changing sessions, query again and check the
+destination. Neither indices nor IDs are persistent configuration identities.
+
+Multi-display enumeration is not a guarantee of cross-display movement:
+`move-window` confirms sole Space membership, does not explicitly reposition
+the frame (macOS may adjust it), and does not confirm which physical screen displays the window or
+that every display's active Space stayed unchanged. Check membership, frame,
+visibility, and each display's active Space separately when testing this case.
+Mirroring, "Displays have separate Spaces" disabled, and hot-plug during a write
+remain outside the verified scope. Reorder/swap remain same-display operations.
+
+### Mutation behavior
+
 - `activate` makes the target current on its display. It does not promise keyboard-focus transfer between displays.
 - `move` puts the source at the target's **original position**; intervening Desktops shift.
 - `swap` exchanges positions. A nonadjacent swap uses two confirmed moves and is **not atomic**.

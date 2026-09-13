@@ -32,6 +32,8 @@ typedef struct {
     nsk_space_id space[2];
     nsk_window_id window;
     uint32_t destroy_options;
+    const char *display;
+    uint64_t display_index;
 } nsk_request;
 
 static const struct {
@@ -60,6 +62,7 @@ static const char usage[] =
     "  nsk --version                        {\"version\": \"" NSK_VERSION "\"}\n"
     "  nsk capabilities                     runtime entry-point availability and OS build\n"
     "  nsk list                             every managed Space on every display\n"
+    "  nsk list --display DISPLAY [--display-index N]  filter by exact display identity\n"
     "  nsk create                           create an ordinary Desktop; returns its record\n"
     "  nsk activate ID                      make ID the current Space on its display\n"
     "  nsk destroy ID [--migrate]           remove an inactive, non-last, ordinary Desktop\n"
@@ -70,6 +73,8 @@ static const char usage[] =
     "\n"
     "IDs are native Space IDs from `list`/`create` (never Desktop numbers) and CGWindow\n"
     "IDs, written as plain decimal digits: no sign, whitespace, zero, or overflow.\n"
+    "list filters preserve original indices; --display-index requires --display.\n"
+    "DISPLAY is the opaque display string from a fresh list, not a screen number.\n"
     "destroy refuses active, last, non-Desktop, and populated targets; --migrate lets\n"
     "macOS migrate application windows to the active Desktop instead of refusing.\n"
     "\n"
@@ -174,6 +179,21 @@ static bool parse(int argc, const char *argv[], nsk_request *request) {
     int count = 0;
     for (int i = 2; i < argc; ++i) {
         const char *argument = argv[i];
+        if (strcmp(argument, "--display") == 0 || strcmp(argument, "--display-index") == 0) {
+            if (request->command != CMD_LIST) return usage_error("display filters only apply to list");
+            if (i + 1 == argc || argv[i + 1][0] == '-' || !argv[i + 1][0])
+                return usage_error("display filter requires a nonempty value");
+            const char *value = argv[++i];
+            if (strcmp(argument, "--display") == 0) {
+                if (request->display) return usage_error("duplicate --display");
+                request->display = value;
+            } else {
+                if (request->display_index) return usage_error("duplicate --display-index");
+                if (!parse_decimal(value, UINT64_MAX, &request->display_index))
+                    return usage_error("--display-index must be a nonzero decimal uint64");
+            }
+            continue;
+        }
         if (strcmp(argument, "--migrate") == 0) {
             if (request->command != CMD_DESTROY) return usage_error("--migrate only applies to destroy");
             request->destroy_options |= NSK_DESTROY_MIGRATE_WINDOWS;
@@ -184,6 +204,8 @@ static bool parse(int argc, const char *argv[], nsk_request *request) {
         positional[count++] = argument;
     }
     if (count < positionals) return usage_error("missing argument");
+    if (request->display_index && !request->display)
+        return usage_error("--display-index requires --display to avoid ambiguous selection");
 
     switch (request->command) {
     case CMD_ACTIVATE:
@@ -300,7 +322,24 @@ static int run(const nsk_request *request) {
         return capabilities();
     case CMD_LIST: {
         NSArray *spaces = copy_snapshot(&error);
-        return spaces ? emit(stdout, @{@"spaces": spaces}, 0) : fail(&error);
+        if (!spaces) return fail(&error);
+        if (request->display) {
+            NSString *display = [NSString stringWithUTF8String:request->display];
+            NSMutableArray *matches = [NSMutableArray array];
+            for (NSDictionary *record in spaces) {
+                if ([record[@"display"] isEqualToString:display] &&
+                    (!request->display_index || [record[@"display_index"] unsignedLongLongValue] == request->display_index))
+                    [matches addObject:record];
+            }
+            if (!matches.count) {
+                error.status = NSK_NOT_FOUND;
+                snprintf(error.message, sizeof error.message,
+                         "No Space matches the display selector; query `nsk list` again after layout changes.");
+                return fail(&error);
+            }
+            spaces = matches;
+        }
+        return emit(stdout, @{@"spaces": spaces}, 0);
     }
     case CMD_CREATE: {
         nsk_space_id created = 0;
