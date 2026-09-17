@@ -119,6 +119,20 @@ def test_grammar(nsk):
         ["bogus"],
         ["--version", "extra"],
         ["list", "extra"],
+        ["list", "--display"],
+        ["list", "--display", ""],
+        ["list", "--display", "a", "--display", "b"],
+        ["list", "--display-index", "1"],
+        ["list", "--display", "a", "--display-index"],
+        ["list", "--display", "a", "--display-index", "0"],
+        ["list", "--display", "a", "--display-index", "+1"],
+        ["list", "--display", "a", "--display-index", " 1"],
+        ["list", "--display", "a", "--display-index", "1.0"],
+        ["list", "--display", "a", "--display-index", "18446744073709551616"],
+        ["list", "--display", "a", "--display-index", "1", "--display-index", "2"],
+        ["list", "--display", "--display-index", "1"],
+        ["activate", U64_MAX, "--display", "a"],
+        ["move-window", U32_MAX, U64_MAX, "--display-index", "1"],
         ["capabilities", "--migrate"],
         ["activate"],
         ["activate", U64_MAX, U64_MAX],
@@ -190,6 +204,30 @@ def validate_snapshot(spaces, label):
         check(len(active) == 1, "%s: display %r has %d active records, expected 1" % (label, display, len(active)))
 
 
+def test_display_filters(nsk, spaces):
+    """Compare selectors with the unfiltered census, including original indices."""
+    for display in dict.fromkeys(record["display"] for record in spaces):
+        expected = [record for record in spaces if record["display"] == display]
+        selected = expect_success(nsk, ["list", "--display", display])
+        check(selected == {"spaces": expected}, "display filter preserves records and indices")
+        for record in expected:
+            # Options need not be in a particular order.
+            selected = expect_success(nsk, ["list", "--display-index", str(record["display_index"]),
+                                            "--display", display])
+            check(selected == {"spaces": [record]}, "display-local selection returns exact record")
+
+    for args in (["list", "--display", "nsk-test-nonexistent-display"],
+                 ["list", "--display", spaces[0]["display"], "--display-index", U64_MAX]):
+        code, out, err = run(nsk, args)
+        check(code == 1 and out == "", "unmatched selector fails without stdout")
+        payload = one_object(err, "unmatched selector")
+        if payload:
+            check(payload.get("error", {}).get("code") == "not_found", "unmatched selector: not_found")
+            check(payload.get("error", {}).get("request_may_have_applied") is False,
+                  "unmatched selector cannot have written")
+            check("observed_spaces" not in payload, "unmatched selector has no write snapshot")
+
+
 def test_live(nsk):
     """Read-only commands against the running session; skipped without a GUI."""
     code, out, err = run(nsk, ["capabilities"])
@@ -223,6 +261,8 @@ def test_live(nsk):
         if listing is not None:
             check(set(listing) == {"spaces"}, "list: keys %r" % sorted(listing))
             validate_snapshot(listing.get("spaces"), "list")
+            if listing.get("spaces"):
+                test_display_filters(nsk, listing["spaces"])
     else:
         print("SKIP list: space_query unavailable")
 
