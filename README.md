@@ -22,6 +22,10 @@ See [the findings record](docs/findings.md) for exact mechanisms, controls, nega
 
 ## Build
 
+A source [Homebrew formula and tap setup guide](docs/homebrew.md) are available
+for packaging review. An author-maintained tap still needs to be created and
+published; this is not yet an advertised Homebrew installation channel.
+
 Requires macOS and Xcode Command Line Tools or Xcode. No package-manager dependencies are required for the library or CLI.
 
 ```sh
