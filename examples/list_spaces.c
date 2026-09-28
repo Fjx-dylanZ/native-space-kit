@@ -56,9 +56,10 @@ int main(void) {
 
     nsk_capabilities caps;
     if (nsk_get_capabilities(&caps, &error) != NSK_OK) return fail("nsk_get_capabilities", &error);
-    printf("native-space-kit %s: query=%d window_query=%d create=%d destroy=%d activate=%d move_window=%d reorder=%d\n",
+    printf("native-space-kit %s: query=%d window_query=%d create=%d destroy=%d activate=%d move_window=%d "
+           "reorder=%d add_window=%d assign_process=%d\n",
            NSK_VERSION, caps.space_query, caps.window_query, caps.create_space, caps.destroy_space,
-           caps.activate_space, caps.move_window, caps.reorder_spaces);
+           caps.activate_space, caps.move_window, caps.reorder_spaces, caps.add_window, caps.assign_process);
 
     CFArrayRef spaces = NULL;
     if (nsk_copy_spaces(&spaces, &error) != NSK_OK) return fail("nsk_copy_spaces", &error);

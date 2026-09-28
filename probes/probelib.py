@@ -167,6 +167,12 @@ class Nsk(Tool):
     def move_window(self, window_id, space_id):
         return self.invoke("move-window", window_id, space_id)
 
+    def add_window(self, window_id, space_id):
+        return self.invoke("add-window", window_id, space_id)
+
+    def assign(self, pid, target):
+        return self.invoke("assign", pid, target)
+
     def move(self, source_id, target_id):
         return self.invoke("move", source_id, target_id)
 
@@ -208,6 +214,24 @@ class Observer(Tool):
 
     def tag(self, window_id, on):
         return self.invoke("tag", window_id, "on" if on else "off")
+
+    def join(self, window_id, space_id):
+        return self.invoke("join", window_id, space_id)
+
+    def place(self, window_id, space_id):
+        return self.invoke("place", window_id, space_id)
+
+    def assign(self, pid, space_id):
+        return self.invoke("assign", pid, space_id)
+
+    def assign_all(self, pid):
+        return self.invoke("assign-all", pid)
+
+    def overlay_create(self, level):
+        return self.invoke("overlay", "create", level)
+
+    def overlay_destroy(self, space_id):
+        return self.invoke("overlay", "destroy", space_id)
 
 
 def guard_session(observer):
@@ -293,6 +317,9 @@ class Fixture:
 
     def sticky(self, index, on):
         return self.command("sticky %d %s" % (index, "on" if on else "off"))["window"]
+
+    def front(self, index):
+        return self.command("front %d" % index)["window"]
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -483,6 +510,7 @@ def summarize_window(window):
         "memberships": window.get("memberships"),
         "sticky_bit": window.get("sticky_bit"),
         "tags_hex": window.get("tags_hex"),
+        "onscreen_order": window.get("onscreen_order"),
         "hosting": {str(h["space_id"]): {"up": h["up"], "including_parked": h["including_parked"], "active": h["active"]}
                     for h in window.get("hosting", [])},
     }

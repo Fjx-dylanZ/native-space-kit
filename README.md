@@ -1,8 +1,9 @@
 # native-space-kit
 
 Control macOS Spaces with SIP enabled: list, create, switch, reorder, and
-destroy Desktops, and move windows between them. Ships as a C library and a
-JSON command-line tool, `nsk`.
+destroy Desktops, move windows between them, show a window on several
+Desktops, and assign apps to every Desktop or to one. Ships as a C library and
+a JSON command-line tool, `nsk`.
 
 It calls private SkyLight window-management operations directly. There is no
 Dock injection, scripting addition, or synthetic gesture. Private APIs can
@@ -20,9 +21,11 @@ fullscreen Spaces are untested.
 | Create a Desktop | `create` | Works |
 | Switch Space | `activate` | Works, without the slide animation |
 | Destroy a Desktop | `destroy` | Works for inactive Desktops |
-| Move a window | `move-window` | Works for ordinary single-Space windows |
+| Move a window | `move-window` | Works for ordinary, non-sticky windows |
 | Reorder Desktops | `move`, `swap` | Works within one display |
-| Make another app's window sticky | | Not supported |
+| Show a window on several Desktops | `add-window` | Works; the window doesn't join new Desktops |
+| Put an app on every Desktop, or pin it to one | `assign` | Works until the app quits |
+| Keep one window on every Desktop, including new ones | | Not in the kit; works through the probes ([findings §7](docs/findings.md#7-sticky-windows)) |
 
 [docs/findings.md](docs/findings.md) documents the private operations and how
 each result was verified.
@@ -56,6 +59,8 @@ nsk capabilities                     # private API availability and OS build
 nsk create
 nsk activate SPACE_ID
 nsk move-window WINDOW_ID SPACE_ID
+nsk add-window WINDOW_ID SPACE_ID
+nsk assign PID all|none|SPACE_ID
 nsk move SOURCE_ID TARGET_ID
 nsk swap SPACE_A SPACE_B
 nsk destroy SPACE_ID [--migrate]
@@ -79,6 +84,17 @@ arguments and 1 otherwise. See `nsk --help`.
   windows to the active Desktop.
 - `activate` switches the Space on the target's display. It does not move
   keyboard focus between displays.
+- `add-window` also shows a window on another Desktop of the same display and
+  keeps its current ones. Run it once per Desktop; `move-window` puts the window
+  back on a single Desktop.
+- `assign` works on every current and future window of an app, like the Dock's
+  *Assign To* menu: `all` puts it on every Desktop, including new ones, and a
+  Space ID pins it to that Desktop. `none` clears the assignment; windows that
+  were on every Desktop stay on the current one. Nothing is saved, and the app
+  needs at least one window. `PID` is the app's process ID, for example from
+  `pgrep -x TextEdit`.
+- `move-window` and `add-window` refuse sticky windows, whether sticky through
+  `assign` or the app's own setting.
 
 ### Errors
 

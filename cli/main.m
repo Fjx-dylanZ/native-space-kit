@@ -23,14 +23,20 @@ typedef enum {
     CMD_DESTROY,
     CMD_WINDOW_SPACES,
     CMD_MOVE_WINDOW,
+    CMD_ADD_WINDOW,
+    CMD_ASSIGN,
     CMD_MOVE,
     CMD_SWAP
 } nsk_command;
+
+typedef enum { ASSIGN_ALL, ASSIGN_NONE, ASSIGN_SPACE } nsk_assignment;
 
 typedef struct {
     nsk_command command;
     nsk_space_id space[2];
     nsk_window_id window;
+    pid_t pid;
+    nsk_assignment assignment;
     uint32_t destroy_options;
     const char *display;
     uint64_t display_index;
@@ -52,6 +58,8 @@ static const struct {
     {"destroy", CMD_DESTROY, 1},
     {"window-spaces", CMD_WINDOW_SPACES, 1},
     {"move-window", CMD_MOVE_WINDOW, 2},
+    {"add-window", CMD_ADD_WINDOW, 2},
+    {"assign", CMD_ASSIGN, 2},
     {"move", CMD_MOVE, 2},
     {"swap", CMD_SWAP, 2},
 };
@@ -67,16 +75,23 @@ static const char usage[] =
     "  nsk activate ID                      make ID the current Space on its display\n"
     "  nsk destroy ID [--migrate]           remove an inactive, non-last, ordinary Desktop\n"
     "  nsk window-spaces WINDOW_ID          native Space IDs that contain a window\n"
-    "  nsk move-window WINDOW_ID SPACE_ID   move an ordinary window to an ordinary Desktop\n"
+    "  nsk move-window WINDOW_ID SPACE_ID   move an ordinary window to one ordinary Desktop\n"
+    "  nsk add-window WINDOW_ID SPACE_ID    also show a window on another Desktop, keeping the others\n"
+    "  nsk assign PID all|none|SPACE_ID     every Desktop, no assignment, or one Desktop for\n"
+    "                                       all current and future windows of a process\n"
     "  nsk move SOURCE_ID TARGET_ID         place SOURCE at TARGET's original position\n"
     "  nsk swap ID_A ID_B                   exchange two positions (two moves; not atomic)\n"
     "\n"
-    "IDs are native Space IDs from `list`/`create` (never Desktop numbers) and CGWindow\n"
-    "IDs, written as plain decimal digits: no sign, whitespace, zero, or overflow.\n"
+    "IDs are native Space IDs from `list`/`create` (never Desktop numbers), CGWindow\n"
+    "IDs, and process IDs, written as plain decimal digits: no sign, whitespace, zero,\n"
+    "or overflow.\n"
     "list filters preserve original indices; --display-index requires --display.\n"
     "DISPLAY is the opaque display string from a fresh list, not a screen number.\n"
     "destroy refuses active, last, non-Desktop, and populated targets; --migrate lets\n"
     "macOS migrate application windows to the active Desktop instead of refusing.\n"
+    "add-window does not follow Desktops created later; move-window undoes it. assign\n"
+    "ends when the process exits; `none` leaves windows that were on every Desktop\n"
+    "on the current one.\n"
     "\n"
     "Success: one JSON object on stdout, exit 0. Failure: {\"error\":{code,message,\n"
     "space_id?,window_id?,request_may_have_applied}} on stderr; exit 2 when arguments\n"
@@ -161,6 +176,24 @@ static bool parse_window(const char *text, const char *label, nsk_window_id *out
     return usage_error(message);
 }
 
+static bool parse_assignment(const char *pid, const char *target, nsk_request *request) {
+    uint64_t value = 0;
+    if (!parse_decimal(pid, INT32_MAX, &value))
+        return usage_error("PID must be a nonzero decimal process ID with no sign or whitespace");
+    request->pid = (pid_t)value;
+    if (strcmp(target, "all") == 0) {
+        request->assignment = ASSIGN_ALL;
+        return true;
+    }
+    if (strcmp(target, "none") == 0) {
+        request->assignment = ASSIGN_NONE;
+        return true;
+    }
+    request->assignment = ASSIGN_SPACE;
+    if (parse_decimal(target, UINT64_MAX, &request->space[0])) return true;
+    return usage_error("assign target must be all, none, or a nonzero decimal uint64 Space ID");
+}
+
 static bool parse(int argc, const char *argv[], nsk_request *request) {
     memset(request, 0, sizeof *request);
     if (argc < 2) return usage_error("missing command");
@@ -214,8 +247,11 @@ static bool parse(int argc, const char *argv[], nsk_request *request) {
     case CMD_WINDOW_SPACES:
         return parse_window(positional[0], "WINDOW_ID", &request->window);
     case CMD_MOVE_WINDOW:
+    case CMD_ADD_WINDOW:
         return parse_window(positional[0], "WINDOW_ID", &request->window) &&
                parse_space(positional[1], "SPACE_ID", &request->space[0]);
+    case CMD_ASSIGN:
+        return parse_assignment(positional[0], positional[1], request);
     case CMD_MOVE:
         return parse_space(positional[0], "SOURCE_ID", &request->space[0]) &&
                parse_space(positional[1], "TARGET_ID", &request->space[1]);
@@ -302,6 +338,8 @@ static int capabilities(void) {
             @"activate_space": @(caps.activate_space),
             @"move_window": @(caps.move_window),
             @"reorder_spaces": @(caps.reorder_spaces),
+            @"add_window": @(caps.add_window),
+            @"assign_process": @(caps.assign_process),
         },
         @"os": @{
             @"version": [NSString stringWithFormat:@"%ld.%ld.%ld",
@@ -357,6 +395,19 @@ static int run(const nsk_request *request) {
     case CMD_MOVE_WINDOW:
         if (nsk_move_window(request->window, a, &error) != NSK_OK) return fail(&error);
         return emit_window_spaces(request->window, a);
+    case CMD_ADD_WINDOW:
+        if (nsk_add_window_to_space(request->window, a, &error) != NSK_OK) return fail(&error);
+        return emit_window_spaces(request->window, a);
+    case CMD_ASSIGN: {
+        nsk_status status = request->assignment == ASSIGN_ALL ? nsk_assign_process_to_all_spaces(request->pid, &error)
+                          : request->assignment == ASSIGN_NONE ? nsk_clear_process_assignment(request->pid, &error)
+                                                               : nsk_assign_process_to_space(request->pid, a, &error);
+        if (status != NSK_OK) return fail(&error);
+        static NSString *const names[] = {[ASSIGN_ALL] = @"all", [ASSIGN_NONE] = @"none", [ASSIGN_SPACE] = @"space"};
+        NSMutableDictionary *payload = [@{@"pid": @(request->pid), @"assignment": names[request->assignment]} mutableCopy];
+        if (request->assignment == ASSIGN_SPACE) payload[@"space_id"] = @(a);
+        return emit(stdout, payload, 0);
+    }
     case CMD_MOVE:
         if (nsk_move_space(a, b, &error) != NSK_OK) return fail(&error);
         return emit_record(@"moved", a, @"spaces");
@@ -377,6 +428,8 @@ static bool mutates(nsk_command command) {
     case CMD_ACTIVATE:
     case CMD_DESTROY:
     case CMD_MOVE_WINDOW:
+    case CMD_ADD_WINDOW:
+    case CMD_ASSIGN:
     case CMD_MOVE:
     case CMD_SWAP:
         return true;

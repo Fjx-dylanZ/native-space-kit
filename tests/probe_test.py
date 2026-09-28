@@ -86,6 +86,15 @@ class ProbeSafety(unittest.TestCase):
         verdict = experiment.verdict_join(entry, 2, False)
         self.assertEqual(verdict["verdict"], "inconclusive")
 
+    def test_app_wide_assignment_requires_the_sibling_to_follow(self):
+        entry = {"target": {"memberships": [1, 2]}, "control": {"memberships": [1]},
+                 "target_visibility": {"visibility": "stable_visible"},
+                 "control_visibility": {"visibility": "stable_hidden"}}
+        self.assertEqual(sticky.Experiment.verdict_app_wide(entry, 2)["verdict"], "inconclusive")
+        entry["control"]["memberships"] = [1, 2]
+        entry["control_visibility"]["visibility"] = "stable_visible"
+        self.assertEqual(sticky.Experiment.verdict_app_wide(entry, 2)["verdict"], "applied")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,7 @@ nsk capabilities
 
 - Displays (how many; "Displays have separate Spaces" on or off):
 - Fullscreen or tile Spaces present:
+- Apps assigned to Desktops (Dock > Options > Assign To):
 - Session (unlocked and logged in, locked, fast user switching):
 - Other window managers or Space tools running (yabai, Amethyst, etc.):
 

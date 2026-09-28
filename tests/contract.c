@@ -122,6 +122,19 @@ static void test_before_initialize(void) {
     EXPECT("move_window zero space", NSK_INVALID_ARGUMENT, nsk_move_window(UINT32_MAX, 0, &e));
     EXPECT("move_window uninitialized", NSK_NOT_INITIALIZED, nsk_move_window(UINT32_MAX, UINT64_MAX, &e));
 
+    EXPECT("add_window zero window", NSK_INVALID_ARGUMENT, nsk_add_window_to_space(0, UINT64_MAX, &e));
+    EXPECT("add_window zero space", NSK_INVALID_ARGUMENT, nsk_add_window_to_space(UINT32_MAX, 0, &e));
+    EXPECT("add_window uninitialized", NSK_NOT_INITIALIZED, nsk_add_window_to_space(UINT32_MAX, UINT64_MAX, &e));
+
+    EXPECT("assign_all zero pid", NSK_INVALID_ARGUMENT, nsk_assign_process_to_all_spaces(0, &e));
+    EXPECT("assign_all negative pid", NSK_INVALID_ARGUMENT, nsk_assign_process_to_all_spaces(-1, &e));
+    EXPECT("assign_all uninitialized", NSK_NOT_INITIALIZED, nsk_assign_process_to_all_spaces(INT32_MAX, &e));
+    EXPECT("assign_space zero pid", NSK_INVALID_ARGUMENT, nsk_assign_process_to_space(0, UINT64_MAX, &e));
+    EXPECT("assign_space zero space", NSK_INVALID_ARGUMENT, nsk_assign_process_to_space(INT32_MAX, 0, &e));
+    EXPECT("assign_space uninitialized", NSK_NOT_INITIALIZED, nsk_assign_process_to_space(INT32_MAX, UINT64_MAX, &e));
+    EXPECT("clear_assignment zero pid", NSK_INVALID_ARGUMENT, nsk_clear_process_assignment(0, &e));
+    EXPECT("clear_assignment uninitialized", NSK_NOT_INITIALIZED, nsk_clear_process_assignment(INT32_MAX, &e));
+
     EXPECT("move_space zero source", NSK_INVALID_ARGUMENT, nsk_move_space(0, UINT64_MAX, &e));
     EXPECT("move_space zero target", NSK_INVALID_ARGUMENT, nsk_move_space(UINT64_MAX, 0, &e));
     EXPECT("move_space uninitialized", NSK_NOT_INITIALIZED, nsk_move_space(UINT64_MAX, UINT64_MAX - 1, &e));
@@ -288,6 +301,10 @@ static void test_initialized(void) {
     EXPECT("activate_space zero (initialized)", NSK_INVALID_ARGUMENT, nsk_activate_space(0, &e));
     EXPECT("destroy_space zero (initialized)", NSK_INVALID_ARGUMENT, nsk_destroy_space(0, NSK_DESTROY_DEFAULT, &e));
     EXPECT("move_window zero (initialized)", NSK_INVALID_ARGUMENT, nsk_move_window(0, UINT64_MAX, &e));
+    EXPECT("add_window zero (initialized)", NSK_INVALID_ARGUMENT, nsk_add_window_to_space(UINT32_MAX, 0, &e));
+    EXPECT("assign_all zero pid (initialized)", NSK_INVALID_ARGUMENT, nsk_assign_process_to_all_spaces(0, &e));
+    EXPECT("assign_space zero space (initialized)", NSK_INVALID_ARGUMENT, nsk_assign_process_to_space(INT32_MAX, 0, &e));
+    EXPECT("clear_assignment zero pid (initialized)", NSK_INVALID_ARGUMENT, nsk_clear_process_assignment(0, &e));
     EXPECT("move_space zero (initialized)", NSK_INVALID_ARGUMENT, nsk_move_space(0, UINT64_MAX, &e));
     EXPECT("swap_spaces zero (initialized)", NSK_INVALID_ARGUMENT, nsk_swap_spaces(UINT64_MAX, 0, &e));
 }
@@ -298,6 +315,11 @@ static nsk_status refuse_destroy_migrate(nsk_error *e) { return nsk_destroy_spac
 static nsk_status refuse_move_window(nsk_error *e) { return nsk_move_window(UINT32_MAX, UINT64_MAX, e); }
 static nsk_status refuse_move_space(nsk_error *e) { return nsk_move_space(UINT64_MAX, UINT64_MAX - 1, e); }
 static nsk_status refuse_swap(nsk_error *e) { return nsk_swap_spaces(UINT64_MAX, UINT64_MAX - 1, e); }
+static nsk_status refuse_add_window(nsk_error *e) { return nsk_add_window_to_space(UINT32_MAX, UINT64_MAX, e); }
+/* INT32_MAX is far above the kernel's PID range. */
+static nsk_status refuse_assign_all(nsk_error *e) { return nsk_assign_process_to_all_spaces(INT32_MAX, e); }
+static nsk_status refuse_assign_space(nsk_error *e) { return nsk_assign_process_to_space(INT32_MAX, UINT64_MAX, e); }
+static nsk_status refuse_clear_assignment(nsk_error *e) { return nsk_clear_process_assignment(INT32_MAX, e); }
 
 /* Impossible IDs must be refused before any write: not_found (or a locked
  * session, which is checked earlier). An unknown window may additionally
@@ -314,6 +336,10 @@ static void test_nonexistent_targets(void) {
         {"move_window nonexistent", refuse_move_window, true},
         {"move_space nonexistent", refuse_move_space, false},
         {"swap_spaces nonexistent", refuse_swap, false},
+        {"add_window nonexistent", refuse_add_window, true},
+        {"assign_all nonexistent process", refuse_assign_all, false},
+        {"assign_space nonexistent process", refuse_assign_space, false},
+        {"clear_assignment nonexistent process", refuse_clear_assignment, false},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
         nsk_error e;
