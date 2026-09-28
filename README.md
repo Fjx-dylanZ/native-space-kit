@@ -1,134 +1,100 @@
 # native-space-kit
 
-Native macOS Space control with SIP enabled: an Objective-C implementation, a public C API, and a JSON command-line tool.
+Control macOS Spaces with SIP enabled: list, create, switch, reorder, and
+destroy Desktops, and move windows between them. Ships as a C library and a
+JSON command-line tool, `nsk`.
 
-The core uses private SkyLight WindowManager bridge operations. It does not inject into Dock, synthesize swipe gestures, disable SIP, or run a window manager. Availability and behavior may change with macOS updates.
+It calls private SkyLight window-management operations directly. There is no
+Dock injection, scripting addition, or synthetic gesture. Private APIs can
+change in any macOS update.
 
-## Verified scope
+## Compatibility
 
-The source experiments were run on **macOS 27 Golden Gate RC, build `26A428`, Apple Silicon, with SIP enabled**, using ordinary Desktops on one display. These observations are not a compatibility guarantee for every macOS release.
+Tested on macOS 27 (build 26A428) on Apple Silicon with SIP enabled, using one
+display with ordinary Desktops. Other macOS versions, multiple displays, and
+fullscreen Spaces are untested.
 
-| Operation | Verified behavior |
-| --- | --- |
-| Enumerate Spaces | Native IDs, display identity, order, type, and current Space |
-| Create a Desktop | A real managed type-0 Desktop appears in the census |
-| Activate a Space | Correct window visibility without a sliding transition |
-| Destroy an inactive Desktop | Empty removal; opt-in migration of application windows to the active Desktop |
-| Move a window | Ordinary, single-Space windows move between Desktops |
-| Reorder / swap | Space identity and window membership are preserved |
-| Make another app's window sticky | **Not implemented:** the tested foreign-window primitives did not apply |
+| Operation | Command | Status |
+| --- | --- | --- |
+| List Spaces | `list` | Works |
+| Create a Desktop | `create` | Works |
+| Switch Space | `activate` | Works, without the slide animation |
+| Destroy a Desktop | `destroy` | Works for inactive Desktops |
+| Move a window | `move-window` | Works for ordinary single-Space windows |
+| Reorder Desktops | `move`, `swap` | Works within one display |
+| Make another app's window sticky | | Not supported |
 
-See [the findings record](docs/findings.md) for exact mechanisms, controls, negative results, and untested cases.
+[docs/findings.md](docs/findings.md) documents the private operations and how
+each result was verified.
 
-## Install with Homebrew
+## Install
 
 ```sh
 brew install Fjx-dylanZ/tap/native-space-kit
 ```
 
-The formula builds the latest tagged release (currently `v0.1.0`) from source
-with Xcode Command Line Tools or Xcode; no bottles are published. It installs
-`nsk` on `PATH`, plus the public header, static library, and C example under the
-Homebrew prefix. Run the CLI examples below as `nsk` instead of `build/nsk`.
-`v0.1.0` predates the `list --display`/`--display-index` selectors; build from
-source for those until the next release. Tap maintenance is described in
-[Homebrew packaging](docs/homebrew.md).
+This builds from source and needs Xcode or the Command Line Tools. It installs
+`nsk`, the header, and the static library.
 
-## Build
-
-Requires macOS and Xcode Command Line Tools or Xcode. No package-manager dependencies are required for the library or CLI.
+To build from a checkout:
 
 ```sh
-make
-make check       # read-only contract and CLI checks; no Desktop mutations
-make example     # builds a pure-C API consumer
+make            # build/nsk and build/libnative-space-kit.a
+make check      # read-only tests
+make example    # build/list-spaces, a C example
 ```
 
-Outputs:
-
-- `build/libnative-space-kit.a`
-- `build/nsk`
-- `build/list-spaces` from `make example`
-
-The public header is [`include/native_space_kit.h`](include/native_space_kit.h). A deployment target is not a claim that a particular older OS supplies the private operations; runtime checks return an unsupported result when required entry points or ABIs are absent.
-
-## JSON CLI
-
-Start with read-only queries:
+## Usage
 
 ```sh
-build/nsk capabilities
-build/nsk list
-build/nsk window-spaces WINDOW_ID
+nsk list                             # every Space on every display
+nsk list --display DISPLAY           # Spaces on one display
+nsk list --display DISPLAY --display-index 2
+nsk window-spaces WINDOW_ID          # Spaces that contain a window
+nsk capabilities                     # private API availability and OS build
+
+nsk create
+nsk activate SPACE_ID
+nsk move-window WINDOW_ID SPACE_ID
+nsk move SOURCE_ID TARGET_ID
+nsk swap SPACE_A SPACE_B
+nsk destroy SPACE_ID [--migrate]
 ```
 
-The following commands mutate the logged-in GUI session:
+The second group changes your desktop. Output is one JSON object on stdout
+with exit status 0. Errors are JSON on stderr, with exit status 2 for invalid
+arguments and 1 otherwise. See `nsk --help`.
 
-```sh
-build/nsk create
-build/nsk activate SPACE_ID
-build/nsk move-window WINDOW_ID SPACE_ID
-build/nsk move SOURCE_ID TARGET_ID
-build/nsk swap ID_A ID_B
-build/nsk destroy SPACE_ID
-build/nsk destroy SPACE_ID --migrate
-```
+- `SPACE_ID` is the native `id` from `list`, not a Desktop number. `WINDOW_ID`
+  is a CGWindow ID. Don't store IDs or indices; they can change when displays
+  or sessions change.
+- `DISPLAY` is the `display` string from `list`. `--display-index N` selects
+  the Nth Space on that display, which may be fullscreen; ordinary Desktops
+  have `type` 0.
+- `move` puts SOURCE at TARGET's position and shifts the Spaces in between.
+  Swapping non-adjacent Spaces takes two moves and is not atomic. Both work
+  only within one display, on layouts without fullscreen Spaces.
+- `destroy` refuses the active Space, the last Desktop on a display, non-Desktop
+  Spaces, and Desktops that contain windows. With `--migrate`, macOS moves those
+  windows to the active Desktop.
+- `activate` switches the Space on the target's display. It does not move
+  keyboard focus between displays.
 
-Replace the uppercase arguments with IDs returned by queries. **A native Space ID is not a Desktop number.** `index` is the current one-based global position; `display_index` is one-based within the owning display. Neither is a persistent identity.
+### Errors
 
-### Selecting a Space on multiple displays
+The private calls can report success without doing anything, so every write is
+confirmed by reading the state back for up to 2 seconds. If
+`error.request_may_have_applied` is `true`, the change may still have happened:
+check the error's `observed_spaces` or run `nsk list` before retrying. Nothing
+is rolled back.
 
-First run `build/nsk list` to find the opaque `display` string for the intended
-screen. Use that exact string, quoted, to narrow a fresh census:
-
-```sh
-build/nsk list --display DISPLAY
-build/nsk list --display DISPLAY --display-index 2
-```
-
-`--display-index` requires `--display`; a bare "Desktop 2" is ambiguous across
-screens. It selects the second **Space record** on that display, which may not
-be an ordinary Desktop if fullscreen Spaces are present. Check `type == 0`
-before choosing a Desktop for a window move. Filters preserve the original
-`index` and `display_index` values and the `{"spaces":[...]}` response shape.
-An absent display or index returns `not_found` with exit 1, never a fallback to
-another screen. Existing unfiltered `list` output is unchanged.
-
-Use the selected record's native `id` in mutation commands. These read-only
-selectors do not bind a later write to a topology snapshot: after unplugging a
-display, reordering Spaces, or changing sessions, query again and check the
-destination. Neither indices nor IDs are persistent configuration identities.
-
-Multi-display enumeration is not a guarantee of cross-display movement:
-`move-window` confirms sole Space membership, does not explicitly reposition
-the frame (macOS may adjust it), and does not confirm which physical screen displays the window or
-that every display's active Space stayed unchanged. Check membership, frame,
-visibility, and each display's active Space separately when testing this case.
-Mirroring, "Displays have separate Spaces" disabled, and hot-plug during a write
-remain outside the verified scope. Reorder/swap remain same-display operations.
-
-### Mutation behavior
-
-- `activate` makes the target current on its display. It does not promise keyboard-focus transfer between displays.
-- `move` puts the source at the target's **original position**; intervening Desktops shift.
-- `swap` exchanges positions. A nonadjacent swap uses two confirmed moves and is **not atomic**.
-- `destroy` refuses an active Space, the last Desktop on a display, non-Desktop targets, and normal/floating/modal application windows by default.
-- `destroy --migrate` permits macOS's native window migration. It does not close application windows or implement a manual move loop. Active-Space destruction is still refused.
-- Reorder/swap are currently restricted to same-display, ordinary-Desktop-only layouts. Fullscreen/sticky-window moves are outside the verified window-move contract.
-
-Success produces one JSON object on stdout and exit status 0. Errors produce JSON on stderr and a nonzero exit status. Human-readable help is available through `build/nsk --help`.
-
-### Requested is not applied
-
-A private call can return successfully while doing nothing. The core confirms the corresponding modeled postcondition instead of treating dispatch as success. The live probes additionally check compositor-visible windows.
-
-Inspect `error.request_may_have_applied` after a failure. If true, a native write was submitted: a timeout or later failure does **not** mean that nothing changed. Query the state before retrying. The CLI includes a fresh `observed_spaces` snapshot when it can obtain one. In particular, the first half of a two-operation swap may have applied; the library does not attempt a blind rollback.
-
-`capabilities` reports **runtime entry-point/ABI availability**, not an empirical guarantee that an OS will authorize every write. Only a successful operation and its relevant observations establish applied behavior.
+`capabilities` shows which private entry points exist, not whether writes will
+succeed.
 
 ## C API
 
-The header is valid C and C++. CoreFoundation is part of the public ownership contract; no Swift runtime or Objective-C syntax is required in the caller.
+Include [`native_space_kit.h`](include/native_space_kit.h) and link with
+`-lnative-space-kit -ObjC -lobjc -framework Cocoa`.
 
 ```c
 #include <native_space_kit.h>
@@ -154,40 +120,38 @@ int main(void) {
 }
 ```
 
-### Embedding rules
+- Call `nsk_initialize` first. Call every function except `nsk_error_clear` and
+  `nsk_status_name` on the main thread, with its run loop running; calls from a
+  bare `dispatch_main()` process fail with `NSK_WRONG_THREAD`.
+- Writes run the main run loop while waiting for confirmation, so your code may
+  be re-entered.
+- The caller owns returned CF objects. Any `nsk_error *` argument may be `NULL`.
+- Writes need an unlocked, logged-in GUI session. The library does not request
+  Accessibility or Screen Recording permission.
 
-- Initialize explicitly and call the API on the **process main thread**. The library does not replace the host application's delegate, menus, or activation policy.
-- Keep the process's main thread alive with the application's AppKit/CF run loop. Being submitted to the main dispatch queue is not sufficient if a bare `dispatch_main()` harness has relinquished the original main thread; such calls are refused as `wrong_thread`.
-- Mutations require an unlocked, logged-in GUI session. A locked session can yield restricted Accessibility data or black captures; do not interpret those as valid feature-regression observations.
-- Synchronous confirmation is bounded to two seconds and services the main run loop. Account for possible **run-loop reentrancy** when embedding in an application.
-- Successful CF outputs belong to the caller and must be released with `CFRelease`. Outputs are cleared on failure, except a newly returned native Space ID is retained if subsequent creation confirmation fails, so the caller can inspect it.
-- Errors are caller-owned values; an error pointer may be `NULL`. The core does not print, install event taps, or alter security settings.
-- The core does not request Accessibility or Screen Recording permission. An embedding app or a pixel-capture tool may have separate permission requirements.
+## Live tests
 
-## Opt-in live probes
-
-Run these only in a disposable VM or a GUI session you are prepared to manipulate. They create disposable windows/Spaces, switch desktops, and restore their owned state. They do not intentionally move or delete your existing windows or desktops.
+The probes change your desktop, so run them in a VM or a session you don't mind
+rearranging. They only touch Spaces and windows they create, and they restore
+the original Space order.
 
 ```sh
 make probes
-python3 probes/smoke.py            # read-only by default
-python3 probes/smoke.py --mutate   # verified core-operation scenarios
-python3 probes/sticky.py --mutate  # experimental sticky candidates + owner-side control
+python3 probes/smoke.py             # read-only
+python3 probes/smoke.py --mutate    # exercise every operation
+python3 probes/sticky.py --mutate   # sticky-window experiment
 ```
 
-Keep the guest unlocked while testing. These are native GUI experiments, not ordinary headless CI tests. They restore the original Space order/current Space and clean up their own fixtures; application keyboard-focus restoration is not guaranteed. Any incomplete cleanup is reported rather than hidden.
+## Non-goals
 
-The sticky probe distinguishes actual per-window behavior from app-wide assignment, temporary transition overlap, and a controller repeatedly moving a window. A negative result is useful evidence, not a production `sticky` implementation. No raw user-session logs, window titles, machine identifiers, or recordings are committed to this repository.
+Dock injection, scripting additions, disabling SIP, synthetic gestures, and
+window-manager features such as tiling, hotkeys, or focus policy.
 
-## Deliberate exclusions
+## Acknowledgements
 
-- Dock injection, scripting additions, SIP changes, and synthetic gestures.
-- Tiling policy, hotkeys, focus-following policy, or a background window manager.
-- A fake sticky implementation that carries a window between single memberships.
-- Unverified fullscreen, mixed-layout, multi-display, or OS-version guarantees.
+Builds on private-API research from [yabai](https://github.com/asmvik/yabai) and
+[KiwiDesk](https://github.com/KiwiCanopy/KiwiDesk/pull/990).
 
-## Provenance and license
+## License
 
-The experiments build on private-API work documented by [yabai](https://github.com/asmvik/yabai) and [KiwiDesk's WMBridge investigation](https://github.com/KiwiCanopy/KiwiDesk/pull/990). Older third-party observations are treated as leads, not proof of behavior on the verified build; the findings record distinguishes them.
-
-MIT licensed. See [LICENSE](LICENSE).
+[MIT](LICENSE)

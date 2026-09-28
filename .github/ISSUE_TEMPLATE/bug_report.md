@@ -8,32 +8,32 @@ assignees: ''
 
 ## Environment
 
-Paste the output of these two commands. They are read-only.
+Output of these read-only commands (use `build/nsk` if you built from source):
 
 ```sh
 sw_vers
-build/nsk capabilities
+nsk --version
+nsk capabilities
 ```
 
-- Display layout (one display, several, "Displays have separate Spaces" on/off):
-- Any fullscreen or tile Spaces present:
-- Session state (unlocked, logged-in GUI session; not a locked or fast-user-switched session):
+- Displays (how many; "Displays have separate Spaces" on or off):
+- Fullscreen or tile Spaces present:
+- Session (unlocked and logged in, locked, fast user switching):
 - Other window managers or Space tools running (yabai, Amethyst, etc.):
 
 ## What you ran
 
-The exact command, or the C API call sequence.
+The exact command or C API calls.
 
-## What you expected
+## Expected
 
-## What happened
+## Actual
 
-Paste the JSON that `nsk` printed, including `error.request_may_have_applied`
-and the `observed_spaces` snapshot if present. Redact anything you consider
-sensitive; native Space IDs and window IDs are fine to include.
+The JSON `nsk` printed, including `error.request_may_have_applied` and
+`observed_spaces` if present. Space and window IDs are fine to include.
 
 ## Reproduction
 
-If `python3 probes/smoke.py` (read-only) or `probes/smoke.py --mutate` (only in a
-disposable VM or a session you are prepared to manipulate) reproduces the
-problem, attach the JSON report with machine identifiers removed.
+If `python3 probes/smoke.py` (read-only) or `probes/smoke.py --mutate` (only in
+a VM or a session you don't mind rearranging) reproduces it, attach the JSON
+report with machine identifiers removed.

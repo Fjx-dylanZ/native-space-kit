@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define NSK_VERSION "0.1.0"
+#define NSK_VERSION "0.2.0"
 #define NSK_EXPORT __attribute__((visibility("default")))
 
 typedef uint64_t nsk_space_id;
