@@ -20,11 +20,21 @@ The source experiments were run on **macOS 27 Golden Gate RC, build `26A428`, Ap
 
 See [the findings record](docs/findings.md) for exact mechanisms, controls, negative results, and untested cases.
 
-## Build
+## Install with Homebrew
 
-A source [Homebrew formula and tap setup guide](docs/homebrew.md) are available
-for packaging review. An author-maintained tap still needs to be created and
-published; this is not yet an advertised Homebrew installation channel.
+```sh
+brew install Fjx-dylanZ/tap/native-space-kit
+```
+
+The formula builds the latest tagged release (currently `v0.1.0`) from source
+with Xcode Command Line Tools or Xcode; no bottles are published. It installs
+`nsk` on `PATH`, plus the public header, static library, and C example under the
+Homebrew prefix. Run the CLI examples below as `nsk` instead of `build/nsk`.
+`v0.1.0` predates the `list --display`/`--display-index` selectors; build from
+source for those until the next release. Tap maintenance is described in
+[Homebrew packaging](docs/homebrew.md).
+
+## Build
 
 Requires macOS and Xcode Command Line Tools or Xcode. No package-manager dependencies are required for the library or CLI.
 

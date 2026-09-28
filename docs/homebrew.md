@@ -1,31 +1,33 @@
 # Homebrew packaging
 
-An author-maintained Homebrew tap would remove the clone/build/PATH setup for
-CLI users. [`Formula/native-space-kit.rb`](../Formula/native-space-kit.rb) is a
-ready-to-review source formula for the existing `v0.1.0` tag, including its
-archive SHA-256. It installs `nsk`, the public header, the static library, and
-the C example. It has no service, GUI-session test, or runtime dependencies.
+The author-maintained tap
+[`Fjx-dylanZ/homebrew-tap`](https://github.com/Fjx-dylanZ/homebrew-tap)
+publishes a source formula for the `v0.1.0` tag:
 
-**No author tap is published by this change.** The maintainer must choose and
-create the tap repository, copy in the formula, and publish it before the
-installation command below is available. No release credentials or extra
-workflow permissions are needed for a manually maintained tap.
+```sh
+brew install Fjx-dylanZ/tap/native-space-kit
+```
 
-## Maintainer setup
-
-Following Homebrew's [tap guide](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap):
-
-1. Create `Fjx-dylanZ/homebrew-tap` (or choose another tap name).
-2. Copy this formula to `Formula/native-space-kit.rb` in that repository.
-3. Validate it on macOS with the commands below, commit, and publish the tap.
-4. Only then advertise `brew install Fjx-dylanZ/tap/native-space-kit` in the README.
-   Adjust that command if a different repository name was chosen.
+[`Formula/native-space-kit.rb`](../Formula/native-space-kit.rb) is the reference
+copy of the tap's `Formula/native-space-kit.rb`, including the archive SHA-256;
+keep the two identical. It installs `nsk`, the public header, the static
+library, and the C example. It has no service, GUI-session test, or runtime
+dependencies. Installing by the fully qualified name also satisfies Homebrew's
+[tap trust](https://docs.brew.sh/Tap-Trust) for that formula.
 
 The formula compiles from source using Xcode Command Line Tools or Xcode.
 It does not supply bottles or establish compatibility with untested OS versions.
 Private API availability and the project's verified-scope limits still apply.
 
-## Local review before publishing a tap
+## Tap maintenance
+
+The tap follows Homebrew's
+[tap guide](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap) and is
+maintained manually: formula changes are validated locally, then committed to
+the tap's `main` branch. It has no CI workflows, bottles, or release
+credentials.
+
+## Local review before publishing a formula change
 
 Use a disposable local tap to test the formula from this checkout:
 
@@ -43,6 +45,8 @@ brew untap local/nsk-review
 Use a fresh test installation; do not uninstall an existing user installation
 to run this recipe. `--skip-link` avoids changing which `nsk` is found on PATH.
 `brew test --force` permits testing that unlinked keg; it does not link it.
+`brew tap-new` and `brew test` turn on Homebrew developer mode; run
+`brew developer off` afterwards if it was off before.
 The formula test checks JSON output, pre-initialization argument rejection, and
 links/runs a C consumer against the installed header/library. It never submits
 a native write or requires a logged-in GUI session.
@@ -52,10 +56,12 @@ a native write or requires a logged-in GUI session.
 For each new source tag, update `url` and `sha256` together in the tap formula
 and this reference copy. Download the exact URL and run `shasum -a 256` on the
 archive; never guess the checksum or rewrite an existing release tag. Repeat
-the build, audit, and formula test, then publish the formula update in the tap.
-The version is inferred from the tagged archive URL.
+the build, audit, and formula test, then commit the formula update to the tap
+and confirm `brew install Fjx-dylanZ/tap/native-space-kit` builds the new
+version. The version is inferred from the tagged archive URL; update the
+release named in the README's Homebrew section.
 
-This deliberately starts with manual publication. Bottles and automated tap
-updates can be added later once the maintainer chooses the release process and
-explicitly configures access to the tap. See the
-[Formula Cookbook](https://docs.brew.sh/Formula-Cookbook) for the packaging DSL.
+Bottles and automated tap updates can be added later once the maintainer
+chooses the release process and explicitly configures access to the tap. See
+the [Formula Cookbook](https://docs.brew.sh/Formula-Cookbook) for the packaging
+DSL.
