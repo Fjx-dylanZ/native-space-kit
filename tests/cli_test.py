@@ -21,7 +21,7 @@ U32_MAX = "4294967295"
 SNAPSHOT_KEYS = {"id", "uuid", "display", "index", "display_index", "type", "active"}
 ENTRYPOINTS = {
     "space_query", "window_query", "create_space", "destroy_space",
-    "activate_space", "move_window", "reorder_spaces",
+    "activate_space", "move_window", "reorder_spaces", "add_window", "assign_process",
 }
 
 failures = []
@@ -164,6 +164,22 @@ def test_grammar(nsk):
         ["move-window", "0", U64_MAX],
         ["move-window", "4294967296", U64_MAX],
         ["move-window", U32_MAX, U64_MAX, U64_MAX],
+        ["add-window"],
+        ["add-window", U32_MAX],
+        ["add-window", "0", U64_MAX],
+        ["add-window", U32_MAX, "0"],
+        ["add-window", "4294967296", U64_MAX],
+        ["add-window", U32_MAX, U64_MAX, U64_MAX],
+        ["add-window", U32_MAX, U64_MAX, "--migrate"],
+        ["assign"],
+        ["assign", "2147483647"],
+        ["assign", "0", "all"],
+        ["assign", "-1", "all"],
+        ["assign", "2147483648", "all"],  # INT32_MAX + 1
+        ["assign", "2147483647", "ALL"],
+        ["assign", "2147483647", "0"],
+        ["assign", "2147483647", "-7"],
+        ["assign", "2147483647", "all", "none"],
         ["move"],
         ["move", U64_MAX],
         ["move", U64_MAX, "-2"],

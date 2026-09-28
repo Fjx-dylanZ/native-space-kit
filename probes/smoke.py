@@ -13,6 +13,11 @@ always against Spaces it created itself and windows it owns:
                in the compositor and the home control window to be off-screen
                (not just the active flag), then return home
   move_window  move a fixture window between the home Desktop and an own one
+  add_window   add a fixture window to an own Desktop, require it on both and
+               visible there without its sibling, not on a later Desktop, then
+               return it to one Desktop with move-window
+  assign       app-wide assignment of the fixture process: every Desktop
+               (including a later one), cleared, one Desktop, cleared again
   reorder      move/swap own Desktops including one that is currently active
   guards       refusals that must not write anything
 
@@ -177,7 +182,7 @@ def case_capabilities(ctx):
     caps = ctx.nsk.capabilities()
     entry = caps.get("runtime_entrypoints", {})
     expected = ("space_query", "window_query", "create_space", "destroy_space",
-                "activate_space", "move_window", "reorder_spaces")
+                "activate_space", "move_window", "reorder_spaces", "add_window", "assign_process")
     missing = [k for k in expected if entry.get(k) is not True]
     details = {"runtime_entrypoints": entry, "os": caps.get("os"), "missing": missing}
     if not entry.get("space_query"):
@@ -482,6 +487,113 @@ def case_move_window(ctx):
     return details
 
 
+def case_add_window(ctx):
+    observer = ctx.need_observer()
+    fx = ctx.fixture(2)
+    wid, sibling = fx.ids
+    home = ctx.home_of(wid)
+    own = ctx.create_space()
+    sid = own["id"]
+    both = sorted([home["id"], sid])
+    details = {"home": home["id"], "own_space": sid, "window_id": wid}
+    if own["display"] != home["display"]:
+        raise Skip("created Space landed on another display; cross-display membership is unverified")
+    details["added"] = ctx.nsk.add_window(wid, sid)
+    if (details["added"].get("window_id") != wid or details["added"].get("space_id") != sid
+            or sorted(details["added"].get("space_ids") or []) != both):
+        raise pl.CaseFailure("add-window response does not list both Desktops", **details)
+    details["repeated"] = ctx.nsk.add_window(wid, sid)
+    if sorted(details["repeated"].get("space_ids") or []) != both:
+        raise pl.CaseFailure("repeating add-window changed the memberships", **details)
+
+    def on_both_at_home():
+        w = observer.window(wid)
+        return sorted(w.get("memberships") or []) == both and bool(w.get("onscreen"))
+
+    def visible_without_sibling():
+        target, other = observer.observe(wid, sibling)["windows"]
+        return bool(target.get("onscreen") and pl.hosting(target, sid)["up"] and not other.get("onscreen"))
+
+    details["at_home"] = stable(ctx, on_both_at_home)
+    if not ok(details["at_home"]):
+        raise pl.CaseFailure("window not stably on both Desktops while home is current", **details)
+    ctx.nsk.activate(sid)
+    details["on_own"] = stable(ctx, visible_without_sibling)
+    if not ok(details["on_own"]):
+        raise pl.CaseFailure("added window not visible on the added Desktop, or its sibling followed", **details)
+    ctx.nsk.activate(home["id"])
+    later = ctx.create_space()["id"]
+    details["later_space"] = later
+    details["later_not_joined"] = stable(ctx, lambda: later not in (observer.window(wid).get("memberships") or []))
+    if not ok(details["later_not_joined"]):
+        raise pl.CaseFailure("added window joined a Desktop created later", **details)
+    absent = ctx.nsk.expect_error("add-window", wid, pl.NONEXISTENT_SPACE_ID)
+    details["nonexistent_destination"] = absent.summary()
+    if absent.code != "not_found" or absent.request_may_have_applied:
+        raise pl.CaseFailure("adding to a nonexistent Space must fail with NSK_NOT_FOUND", **details)
+    details["collapsed"] = ctx.nsk.move_window(wid, home["id"])
+    if details["collapsed"].get("space_ids") != [home["id"]]:
+        raise pl.CaseFailure("move-window did not return the window to one Desktop", **details)
+    details["after_collapse"] = stable(ctx, lambda: observer.window(wid).get("memberships") == [home["id"]])
+    if not ok(details["after_collapse"]):
+        raise pl.CaseFailure("window did not stay on its home Desktop alone", **details)
+    return details
+
+
+def case_assign(ctx):
+    observer = ctx.need_observer()
+    fx = ctx.fixture(2)
+    ids = list(fx.ids)
+    home = ctx.home_of(ids[0])
+    own = ctx.create_space()
+    sid = own["id"]
+    details = {"pid": fx.pid, "home": home["id"], "own_space": sid, "windows": ids}
+    if own["display"] != home["display"]:
+        raise Skip("created Space landed on another display; cross-display assignment is unverified")
+
+    def memberships():
+        return [sorted(w.get("memberships") or []) for w in observer.observe(*ids)["windows"]]
+
+    def all_on(expected):
+        return lambda: all(m == expected for m in memberships())
+
+    def desktops():
+        return sorted(s["id"] for s in pl.display_spaces(ctx.nsk.list(), home["display"]) if s["type"] == pl.DESKTOP_TYPE)
+
+    def step(label, target, expected_response, predicate, message):
+        details[label] = ctx.nsk.assign(fx.pid, target)
+        if details[label] != expected_response:
+            raise pl.CaseFailure("assign %s: unexpected response" % target, **details)
+        details[label + "_state"] = stable(ctx, predicate)
+        if not ok(details[label + "_state"]):
+            raise pl.CaseFailure(message, **details)
+
+    step("all", "all", {"pid": fx.pid, "assignment": "all"},
+         lambda: all(m == desktops() for m in memberships()), "not every window joined every Desktop")
+    later = ctx.create_space()["id"]
+    details["later_space"] = later
+    details["later_joined"] = stable(ctx, lambda: all(later in m for m in memberships()))
+    if not ok(details["later_joined"]):
+        raise pl.CaseFailure("assigned windows did not join a Desktop created later", **details)
+    refused = ctx.nsk.expect_error("move-window", ids[0], home["id"])
+    details["move_assigned"] = refused.summary()
+    if refused.code != "unsupported_window" or refused.request_may_have_applied:
+        raise pl.CaseFailure("moving an app-assigned window must be refused before any write", **details)
+    ctx.nsk.activate(sid)
+    step("none_from_all", "none", {"pid": fx.pid, "assignment": "none"}, all_on([sid]),
+         "clearing did not leave the windows on the current Desktop only")
+    ctx.nsk.activate(home["id"])
+    step("space", home["id"], {"pid": fx.pid, "assignment": "space", "space_id": home["id"]}, all_on([home["id"]]),
+         "assigning to a Desktop did not move every window there")
+    step("none_from_space", "none", {"pid": fx.pid, "assignment": "none"}, all_on([home["id"]]),
+         "clearing a Desktop assignment moved the windows")
+    absent = ctx.nsk.expect_error("assign", fx.pid, pl.NONEXISTENT_SPACE_ID)
+    details["nonexistent_space"] = absent.summary()
+    if absent.code != "not_found" or absent.request_may_have_applied:
+        raise pl.CaseFailure("assigning to a nonexistent Space must fail with NSK_NOT_FOUND", **details)
+    return details
+
+
 def expect_move(order, source, target):
     """Public move semantics: source lands on target's ORIGINAL position, the rest shifts."""
     result = list(order)
@@ -589,7 +701,8 @@ def case_guards(ctx):
     problems = []
     trials = [("destroy", own["id"], "active_space"),
               ("destroy", pl.NONEXISTENT_SPACE_ID, "not_found"),
-              ("activate", pl.NONEXISTENT_SPACE_ID, "not_found")]
+              ("activate", pl.NONEXISTENT_SPACE_ID, "not_found"),
+              ("assign", "2147483647", "all", "not_found")]
     for trial in trials:
         argv, expected = trial[:-1], trial[-1]
         err = ctx.nsk.expect_error(*argv)
@@ -618,6 +731,8 @@ CASES = [
     ("migration", case_migration, True),
     ("activation", case_activation, True),
     ("move_window", case_move_window, True),
+    ("add_window", case_add_window, True),
+    ("assign", case_assign, True),
     ("reorder", case_reorder, True),
     ("guards", case_guards, True),
 ]

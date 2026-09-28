@@ -13,12 +13,13 @@
 //       GUI session facts used to guard visible tests: on_console, login_done,
 //       locked (CGSessionCopyCurrentDictionary).
 //   sticky-probe observe WINDOW_ID [WINDOW_ID...]
-//       Per window: CG description (pid, layer, alpha, bounds, onscreen),
-//       native Space memberships (SLSCopySpacesForWindows selector 7), window
-//       tags (SLSWindowQuery iterator) with bit 0x800 decoded as sticky_bit,
-//       and a per-Space "hosting" table: whether the compositor lists the
-//       window for that Space with options 0x2 ("up") and 0x7
-//       ("including_parked"), the same census yabai uses.
+//       Per window: CG description (pid, layer, alpha, bounds, onscreen,
+//       front-to-back onscreen_order), native Space memberships
+//       (SLSCopySpacesForWindows selector 7), window tags (SLSWindowQuery
+//       iterator) with bit 0x800 decoded as sticky_bit, and a per-Space
+//       "hosting" table: whether the compositor lists the window for that
+//       Space with options 0x2 ("up") and 0x7 ("including_parked"), the same
+//       census yabai uses.
 //   sticky-probe census SPACE_ID
 //       The two window lists for one Space plus CG metadata for each entry.
 //
@@ -32,11 +33,28 @@
 //   sticky-probe tag WINDOW_ID on|off
 //       SLSSetWindowTags / SLSClearWindowTags with tag 0x800 on the main
 //       connection of this process.
+//   sticky-probe join WINDOW_ID SPACE_ID
+//   sticky-probe place WINDOW_ID SPACE_ID
+//       SLSBridgedSpaceAddWindowsAndRemoveFromSpacesOperation
+//       initWithSpaceID:windows:options: with options 0 (add, keep the other
+//       memberships) or 7 (add and leave every other Space).
+//   sticky-probe assign PID SPACE_ID|0
+//       SLSBridgedProcessAssignToSpaceOperation initWithProcess:spaceID:;
+//       0 clears the process's assignment.
+//   sticky-probe assign-all PID
+//       SLSBridgedProcessAssignToAllSpacesOperation initWithProcess:
+//   sticky-probe overlay create LEVEL
+//       SLSBridgedSpaceCreateOperation with options 1 (an unmanaged Space
+//       outside the Desktop census), then SLSBridgedSpaceSetAbsoluteLevel-
+//       Operation and SLSBridgedShowSpacesOperation.
+//   sticky-probe overlay destroy SPACE_ID
+//       Hide and destroy an unmanaged Space; refuses managed Spaces.
 //
-// A write reports "dispatched" (the operation was submitted) plus the
-// observation taken after briefly servicing the run loop. Dispatch is not
-// application: the Python experiment decides applied / not_applied /
-// inconclusive from stable compositor visibility, membership and tags.
+// A write reports "dispatched" (the operation was submitted) plus, for window
+// writes, the observation taken after briefly servicing the run loop.
+// Dispatch is not application: the Python experiment decides applied /
+// not_applied / inconclusive from stable compositor visibility, membership
+// and tags.
 
 #import <Cocoa/Cocoa.h>
 #import <objc/message.h>
@@ -49,6 +67,14 @@
 #include <string.h>
 
 #define STICKY_TAG ((uint64_t)0x800)
+// SLSBridgedSpaceAddWindowsAndRemoveFromSpacesOperation options observed on
+// 26A428: 0 adds the window and keeps its other memberships; a value with both
+// bits 0x1 and 0x4 set also removes it from every other Space.
+#define ADD_KEEP_OTHERS 0u
+#define ADD_LEAVE_OTHERS 7u
+// SLSBridgedSpaceCreateOperation options 1 created an unmanaged type-3 Space.
+#define CREATE_UNMANAGED 1u
+#define UNMANAGED_SPACE_TYPE 3
 
 static int connection;
 static CFArrayRef (*copyManagedSpaces)(int);
@@ -67,7 +93,7 @@ static CGError (*clearWindowTags)(int, uint32_t, uint64_t *, int);
 static int emitJSON(FILE *stream, id object, int status) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingSortedKeys error:NULL];
     if (!data) {
-        fputs("{\"error\":\"serialization_failed\"}\n", stderr);
+        fputs("{\"error\":{\"code\":\"serialization_failed\",\"message\":\"Could not encode the result.\"}}\n", stderr);
         return 1;
     }
     fwrite(data.bytes, 1, data.length, stream);
@@ -76,8 +102,9 @@ static int emitJSON(FILE *stream, id object, int status) {
     return status;
 }
 
+// Same envelope as nsk, so probelib reads code/message/space_id uniformly.
 static int fail(NSString *code, NSString *message) {
-    return emitJSON(stderr, @{@"error": code, @"message": message}, 1);
+    return emitJSON(stderr, @{@"error": @{@"code": code, @"message": message}}, 1);
 }
 
 static BOOL parseUnsigned(const char *text, unsigned long long limit, unsigned long long *out) {
@@ -98,15 +125,34 @@ static void serviceRunLoop(NSTimeInterval seconds) {
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
 }
 
-static BOOL methodMatches(Class cls, SEL selector, const char *result, const char *argument2, const char *argument3) {
+static BOOL methodMatches(Class cls, SEL selector, const char *result, NSArray<NSString *> *arguments) {
     if (!cls) return NO;
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) return NO;
     NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
-    NSUInteger count = 2 + (argument2 != NULL) + (argument3 != NULL);
-    return signature.numberOfArguments == count && strcmp(signature.methodReturnType, result) == 0 &&
-           (!argument2 || strcmp([signature getArgumentTypeAtIndex:2], argument2) == 0) &&
-           (!argument3 || strcmp([signature getArgumentTypeAtIndex:3], argument3) == 0);
+    if (signature.numberOfArguments != 2 + arguments.count || strcmp(signature.methodReturnType, result) != 0) return NO;
+    for (NSUInteger i = 0; i < arguments.count; i++)
+        if (strcmp([signature getArgumentTypeAtIndex:i + 2], arguments[i].UTF8String) != 0) return NO;
+    return YES;
+}
+
+static SEL performSelector(void) {
+    return sel_registerName("performWithWMBridgeDelegate");
+}
+
+// The class, if its initializer and perform method have the expected encodings.
+static Class bridgedClass(NSString *name, SEL initializer, NSArray<NSString *> *arguments, const char *performResult) {
+    Class cls = NSClassFromString(name);
+    return methodMatches(cls, initializer, "@", arguments) && methodMatches(cls, performSelector(), performResult, @[])
+        ? cls : Nil;
+}
+
+static void performAsync(id operation) {
+    ((void (*)(id, SEL))objc_msgSend)(operation, performSelector());
+}
+
+static id performSync(id operation) {
+    return ((id (*)(id, SEL))objc_msgSend)(operation, performSelector());
 }
 
 static BOOL loadSkyLight(void) {
@@ -203,8 +249,20 @@ static NSDictionary *windowInfoIndex(void) {
     return index;
 }
 
+// Window number -> front-to-back position among on-screen windows (all levels).
+static NSDictionary *onscreenOrder(void) {
+    NSArray *onscreen = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID));
+    NSMutableDictionary *order = [NSMutableDictionary dictionaryWithCapacity:onscreen.count];
+    [onscreen enumerateObjectsUsingBlock:^(NSDictionary *info, NSUInteger index, BOOL *stop) {
+        (void)stop;
+        NSNumber *number = info[(__bridge id)kCGWindowNumber];
+        if ([number isKindOfClass:[NSNumber class]]) order[number] = @(index);
+    }];
+    return order;
+}
+
 static NSDictionary *describeWindow(uint32_t windowID, NSArray *spaces, NSDictionary *hostingUp,
-                                    NSDictionary *hostingParked, NSDictionary *infoIndex) {
+                                    NSDictionary *hostingParked, NSDictionary *infoIndex, NSDictionary *order) {
     NSMutableDictionary *record = [@{@"id": @(windowID)} mutableCopy];
     NSDictionary *info = infoIndex[@(windowID)];
     record[@"present"] = info ? @YES : @NO;
@@ -222,6 +280,7 @@ static NSDictionary *describeWindow(uint32_t windowID, NSArray *spaces, NSDictio
     } else {
         record[@"onscreen"] = @NO;
     }
+    record[@"onscreen_order"] = order[@(windowID)] ?: [NSNull null];
     NSArray *memberships = nil;
     if (copySpacesForWindows) {
         CFArrayRef raw = copySpacesForWindows(connection, 7, (__bridge CFArrayRef)@[@(windowID)]);
@@ -254,10 +313,10 @@ static NSDictionary *observation(NSArray *windowIDs) {
         if (up) hostingUp[space[@"id"]] = up;
         if (parked) hostingParked[space[@"id"]] = parked;
     }
-    NSDictionary *infoIndex = windowInfoIndex();
+    NSDictionary *infoIndex = windowInfoIndex(), *order = onscreenOrder();
     NSMutableArray *windows = [NSMutableArray arrayWithCapacity:windowIDs.count];
     for (NSNumber *windowID in windowIDs)
-        [windows addObject:describeWindow(windowID.unsignedIntValue, spaces, hostingUp, hostingParked, infoIndex)];
+        [windows addObject:describeWindow(windowID.unsignedIntValue, spaces, hostingUp, hostingParked, infoIndex, order)];
     return @{@"spaces": spaces, @"current": currentSpaces(spaces), @"windows": windows};
 }
 
@@ -299,21 +358,128 @@ static int commandCensus(uint64_t spaceID) {
                               @"windows": windows, @"current": currentSpaces(spaces)}, 0);
 }
 
-static int commandWindowsSpaces(NSString *className, NSString *label, uint32_t windowID, NSArray *spaceIDs) {
-    Class cls = NSClassFromString(className);
-    SEL initialize = sel_registerName("initWithWindows:spaces:");
-    SEL perform = sel_registerName("performWithWMBridgeDelegate");
-    if (!methodMatches(cls, initialize, "@", "@", "@") || !methodMatches(cls, perform, "v", NULL, NULL))
-        return fail(@"unsupported", [NSString stringWithFormat:@"%@ is unavailable or its ABI changed.", className]);
+static int unsupportedOperation(NSString *className) {
+    return fail(@"unsupported", [NSString stringWithFormat:@"%@ is unavailable or its ABI changed.", className]);
+}
+
+// Dispatch an asynchronous window operation and report the window before and after.
+static int performObserved(id operation, uint32_t windowID, NSDictionary *details) {
+    if (!operation) return fail(@"operation_failed", @"Could not initialize the operation.");
     NSDictionary *before = observation(@[@(windowID)]);
     if (!before) return fail(@"query_failed", @"Could not observe the window before the operation.");
-    id operation = ((id (*)(id, SEL, id, id))objc_msgSend)([cls alloc], initialize, @[@(windowID)], spaceIDs);
-    if (!operation) return fail(@"operation_failed", @"Could not initialize the operation.");
-    ((void (*)(id, SEL))objc_msgSend)(operation, perform);
+    performAsync(operation);
     serviceRunLoop(0.5);
     NSDictionary *after = observation(@[@(windowID)]);
-    return emitJSON(stdout, @{@"operation": label, @"dispatched": @YES, @"window_id": @(windowID), @"space_ids": spaceIDs,
-                              @"before": before[@"windows"][0], @"after": after ? after[@"windows"][0] : [NSNull null]}, 0);
+    NSMutableDictionary *result = [@{@"dispatched": @YES, @"window_id": @(windowID), @"before": before[@"windows"][0],
+                                     @"after": after ? after[@"windows"][0] : [NSNull null]} mutableCopy];
+    [result addEntriesFromDictionary:details];
+    return emitJSON(stdout, result, 0);
+}
+
+static int commandWindowsSpaces(NSString *className, NSString *label, uint32_t windowID, NSArray *spaceIDs) {
+    SEL initialize = sel_registerName("initWithWindows:spaces:");
+    Class cls = bridgedClass(className, initialize, @[@"@", @"@"], "v");
+    if (!cls) return unsupportedOperation(className);
+    id operation = ((id (*)(id, SEL, id, id))objc_msgSend)([cls alloc], initialize, @[@(windowID)], spaceIDs);
+    return performObserved(operation, windowID, @{@"operation": label, @"space_ids": spaceIDs});
+}
+
+static int commandAddAndRemove(NSString *label, uint32_t windowID, uint64_t spaceID, uint32_t options) {
+    NSString *className = @"SLSBridgedSpaceAddWindowsAndRemoveFromSpacesOperation";
+    SEL initialize = sel_registerName("initWithSpaceID:windows:options:");
+    Class cls = bridgedClass(className, initialize, @[@"Q", @"@", @"I"], "v");
+    if (!cls) return unsupportedOperation(className);
+    id operation = ((id (*)(id, SEL, uint64_t, id, uint32_t))objc_msgSend)([cls alloc], initialize, spaceID,
+                                                                          @[@(windowID)], options);
+    return performObserved(operation, windowID, @{@"operation": label, @"space_id": @(spaceID), @"options": @(options)});
+}
+
+static int commandAssign(pid_t pid, uint64_t spaceID, BOOL allSpaces) {
+    NSString *className = allSpaces ? @"SLSBridgedProcessAssignToAllSpacesOperation" : @"SLSBridgedProcessAssignToSpaceOperation";
+    SEL initialize = sel_registerName(allSpaces ? "initWithProcess:" : "initWithProcess:spaceID:");
+    Class cls = bridgedClass(className, initialize, allSpaces ? @[@"i"] : @[@"i", @"Q"], "v");
+    if (!cls) return unsupportedOperation(className);
+    id operation = allSpaces ? ((id (*)(id, SEL, int))objc_msgSend)([cls alloc], initialize, pid)
+                             : ((id (*)(id, SEL, int, uint64_t))objc_msgSend)([cls alloc], initialize, pid, spaceID);
+    if (!operation) return fail(@"operation_failed", @"Could not initialize the operation.");
+    performAsync(operation);
+    serviceRunLoop(0.5);
+    NSMutableDictionary *result = [@{@"operation": allSpaces ? @"assign-all" : @"assign", @"dispatched": @YES,
+                                     @"pid": @(pid)} mutableCopy];
+    if (!allSpaces) result[@"space_id"] = @(spaceID);
+    return emitJSON(stdout, result, 0);
+}
+
+static SEL spaceIDInitializer(void) {
+    return sel_registerName("initWithSpaceID:");
+}
+
+static Class copyValuesClass(void) {
+    return bridgedClass(@"SLSBridgedSpaceCopyValuesOperation", spaceIDInitializer(), @[@"Q"], "@");
+}
+
+// The bridge's values for a Space, or nil once it no longer exists. Callers check
+// copyValuesClass() first and see non-nil values for a live Space before relying
+// on nil as "gone".
+static NSDictionary *spaceValues(uint64_t spaceID) {
+    id operation = ((id (*)(id, SEL, uint64_t))objc_msgSend)([copyValuesClass() alloc], spaceIDInitializer(), spaceID);
+    id result = operation ? performSync(operation) : nil;
+    SEL getter = sel_registerName("propertyListDictionary");
+    id values = [result respondsToSelector:getter] ? ((id (*)(id, SEL))objc_msgSend)(result, getter) : nil;
+    return [values isKindOfClass:[NSDictionary class]] ? values : nil;
+}
+
+static BOOL isManaged(uint64_t spaceID, NSArray *spaces) {
+    for (NSDictionary *space in spaces) if ([space[@"id"] unsignedLongLongValue] == spaceID) return YES;
+    return NO;
+}
+
+static BOOL isOverlay(uint64_t spaceID, NSArray *spaces) {
+    NSDictionary *values = spaceValues(spaceID);
+    return !isManaged(spaceID, spaces) && [values[@"type"] isEqual:@(UNMANAGED_SPACE_TYPE)] && !values[@"ManagedSpaceID"];
+}
+
+static int commandOverlayCreate(int level) {
+    SEL createInit = sel_registerName("initWithOptions:values:"), levelInit = sel_registerName("initWithSpaceID:level:"),
+        showInit = sel_registerName("initWithSpaces:"), spaceIDGetter = sel_registerName("spaceID");
+    Class create = bridgedClass(@"SLSBridgedSpaceCreateOperation", createInit, @[@"I", @"@"], "@");
+    Class setLevel = bridgedClass(@"SLSBridgedSpaceSetAbsoluteLevelOperation", levelInit, @[@"Q", @"i"], "v");
+    Class show = bridgedClass(@"SLSBridgedShowSpacesOperation", showInit, @[@"@"], "v");
+    if (!create || !setLevel || !show || !copyValuesClass())
+        return fail(@"unsupported", @"The overlay operations are unavailable or their ABI changed.");
+    id operation = ((id (*)(id, SEL, uint32_t, id))objc_msgSend)([create alloc], createInit, CREATE_UNMANAGED, @{});
+    id result = operation ? performSync(operation) : nil;
+    uint64_t overlay = [result respondsToSelector:spaceIDGetter] ? ((uint64_t (*)(id, SEL))objc_msgSend)(result, spaceIDGetter) : 0;
+    if (!overlay) return fail(@"operation_failed", @"The bridge did not return a Space ID.");
+    NSArray *spaces = readSpaces();
+    if (!spaces || !isOverlay(overlay, spaces))
+        return emitJSON(stderr, @{@"error": @{@"code": @"unexpected_space", @"space_id": @(overlay),
+                                              @"message": @"The created Space is not an unmanaged overlay; clean it up by ID."}}, 1);
+    performAsync(((id (*)(id, SEL, uint64_t, int))objc_msgSend)([setLevel alloc], levelInit, overlay, level));
+    performAsync(((id (*)(id, SEL, id))objc_msgSend)([show alloc], showInit, @[@(overlay)]));
+    serviceRunLoop(0.3);
+    return emitJSON(stdout, @{@"operation": @"overlay-create", @"overlay_id": @(overlay), @"level": @(level),
+                              @"values": spaceValues(overlay) ?: (id)[NSNull null]}, 0);
+}
+
+static int commandOverlayDestroy(uint64_t overlay) {
+    SEL hideInit = sel_registerName("initWithSpaces:");
+    Class hide = bridgedClass(@"SLSBridgedHideSpacesOperation", hideInit, @[@"@"], "v");
+    Class destroy = bridgedClass(@"SLSBridgedSpaceDestroyOperation", spaceIDInitializer(), @[@"Q"], "v");
+    if (!hide || !destroy || !copyValuesClass())
+        return fail(@"unsupported", @"The overlay operations are unavailable or their ABI changed.");
+    NSArray *spaces = readSpaces();
+    if (!spaces) return fail(@"query_failed", @"Could not read managed Spaces.");
+    if (!isOverlay(overlay, spaces))
+        return fail(@"refused", @"Not an unmanaged overlay Space; managed Spaces are never destroyed here.");
+    performAsync(((id (*)(id, SEL, id))objc_msgSend)([hide alloc], hideInit, @[@(overlay)]));
+    performAsync(((id (*)(id, SEL, uint64_t))objc_msgSend)([destroy alloc], spaceIDInitializer(), overlay));
+    for (int attempt = 0; attempt < 20; attempt++) {
+        serviceRunLoop(0.1);
+        if (!spaceValues(overlay))
+            return emitJSON(stdout, @{@"operation": @"overlay-destroy", @"overlay_id": @(overlay), @"destroyed": @YES}, 0);
+    }
+    return fail(@"not_confirmed", @"The overlay Space still exists after 2 seconds.");
 }
 
 static int commandTag(uint32_t windowID, BOOL on) {
@@ -331,7 +497,9 @@ static int commandTag(uint32_t windowID, BOOL on) {
 
 static int usage(void) {
     return fail(@"usage", @"Usage: sticky-probe session | observe WINDOW_ID... | census SPACE_ID | "
-                          @"add WINDOW_ID SPACE_ID... | remove WINDOW_ID SPACE_ID... | tag WINDOW_ID on|off");
+                          @"add WINDOW_ID SPACE_ID... | remove WINDOW_ID SPACE_ID... | tag WINDOW_ID on|off | "
+                          @"join WINDOW_ID SPACE_ID | place WINDOW_ID SPACE_ID | assign PID SPACE_ID|0 | "
+                          @"assign-all PID | overlay create LEVEL | overlay destroy SPACE_ID");
 }
 
 static int run(int argc, const char *argv[]) {
@@ -343,12 +511,20 @@ static int run(int argc, const char *argv[]) {
     BOOL add = !strcmp(command, "add") && argc >= 4;
     BOOL remove = !strcmp(command, "remove") && argc >= 4;
     BOOL tag = !strcmp(command, "tag") && argc == 4;
-    if (!session && !observe && !census && !add && !remove && !tag) return usage();
+    BOOL join = !strcmp(command, "join") && argc == 4;
+    BOOL place = !strcmp(command, "place") && argc == 4;
+    BOOL assign = !strcmp(command, "assign") && argc == 4;
+    BOOL assignAll = !strcmp(command, "assign-all") && argc == 3;
+    BOOL overlay = !strcmp(command, "overlay") && argc == 4;
+    BOOL overlayCreate = overlay && !strcmp(argv[2], "create");
+    BOOL overlayDestroy = overlay && !strcmp(argv[2], "destroy");
+    if (!session && !observe && !census && !add && !remove && !tag && !join && !place && !assign && !assignAll &&
+        !overlayCreate && !overlayDestroy) return usage();
     if (session) return commandSession();
 
     NSMutableArray *windowIDs = [NSMutableArray array];
     NSMutableArray *spaceIDs = [NSMutableArray array];
-    unsigned long long value = 0;
+    unsigned long long value = 0, pid = 0, level = 0;
     if (observe) {
         for (int i = 2; i < argc; ++i) {
             if (!parseUnsigned(argv[i], UINT32_MAX, &value)) return fail(@"invalid_id", @"Window IDs must be positive decimal uint32 values.");
@@ -356,6 +532,20 @@ static int run(int argc, const char *argv[]) {
         }
     } else if (census) {
         if (!parseUnsigned(argv[2], UINT64_MAX, &value)) return fail(@"invalid_id", @"Space ID must be a positive decimal uint64 value.");
+        [spaceIDs addObject:@((uint64_t)value)];
+    } else if (assign || assignAll) {
+        if (!parseUnsigned(argv[2], INT32_MAX, &pid)) return fail(@"invalid_id", @"PID must be a positive decimal int32 value.");
+        if (assign) {
+            BOOL clear = !strcmp(argv[3], "0");
+            if (!clear && !parseUnsigned(argv[3], UINT64_MAX, &value))
+                return fail(@"invalid_id", @"Space ID must be 0 or a positive decimal uint64 value.");
+            [spaceIDs addObject:@(clear ? 0 : (uint64_t)value)];
+        }
+    } else if (overlayCreate) {
+        if (strcmp(argv[3], "0") && !parseUnsigned(argv[3], INT32_MAX, &level))
+            return fail(@"invalid_level", @"Level must be a non-negative decimal int32 value.");
+    } else if (overlayDestroy) {
+        if (!parseUnsigned(argv[3], UINT64_MAX, &value)) return fail(@"invalid_id", @"Space ID must be a positive decimal uint64 value.");
         [spaceIDs addObject:@((uint64_t)value)];
     } else {
         if (!parseUnsigned(argv[2], UINT32_MAX, &value)) return fail(@"invalid_id", @"Window ID must be a positive decimal uint32 value.");
@@ -379,7 +569,13 @@ static int run(int argc, const char *argv[]) {
     if (census) return commandCensus([spaceIDs[0] unsignedLongLongValue]);
     if (tag) return commandTag([windowIDs[0] unsignedIntValue], !strcmp(argv[3], "on"));
     if (add) return commandWindowsSpaces(@"SLSBridgedAddWindowsToSpacesOperation", @"add", [windowIDs[0] unsignedIntValue], spaceIDs);
-    return commandWindowsSpaces(@"SLSBridgedRemoveWindowsFromSpacesOperation", @"remove", [windowIDs[0] unsignedIntValue], spaceIDs);
+    if (remove) return commandWindowsSpaces(@"SLSBridgedRemoveWindowsFromSpacesOperation", @"remove", [windowIDs[0] unsignedIntValue], spaceIDs);
+    if (join || place)
+        return commandAddAndRemove(join ? @"join" : @"place", [windowIDs[0] unsignedIntValue], [spaceIDs[0] unsignedLongLongValue],
+                                   join ? ADD_KEEP_OTHERS : ADD_LEAVE_OTHERS);
+    if (assign || assignAll) return commandAssign((pid_t)pid, assign ? [spaceIDs[0] unsignedLongLongValue] : 0, assignAll);
+    if (overlayCreate) return commandOverlayCreate((int)level);
+    return commandOverlayDestroy([spaceIDs[0] unsignedLongLongValue]);
 }
 
 int main(int argc, const char *argv[]) {

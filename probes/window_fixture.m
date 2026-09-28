@@ -13,6 +13,8 @@
 //   frames                 -> {"event":"frames","windows":[...]}
 //   sticky INDEX on|off    -> {"event":"sticky",...}  owner-side positive control:
 //                             toggles NSWindowCollectionBehaviorCanJoinAllSpaces
+//   front INDEX            -> {"event":"front",...}   orderFrontRegardless without
+//                             activating the process
 //   quit                   -> {"event":"quit"} then exit 0
 //
 // EOF on stdin terminates the process, so a crashed runner never leaks windows.
@@ -83,16 +85,27 @@ static void handleCommand(NSString *line) {
         quit();
         return;
     }
-    if ([command isEqualToString:@"sticky"]) {
-        BOOL on = arguments.count == 3 && [arguments[2] isEqualToString:@"on"];
-        BOOL off = arguments.count == 3 && [arguments[2] isEqualToString:@"off"];
-        NSInteger index = arguments.count == 3 ? arguments[1].integerValue : -1;
-        if ((!on && !off) || index < 0 || (NSUInteger)index >= fixtureWindows.count ||
-            ![arguments[1] isEqualToString:[NSString stringWithFormat:@"%ld", (long)index]]) {
-            emit(@{@"event": @"error", @"message": @"usage: sticky INDEX on|off"});
+    if ([command isEqualToString:@"sticky"] || [command isEqualToString:@"front"]) {
+        BOOL front = [command isEqualToString:@"front"];
+        NSInteger index = arguments.count >= 2 ? arguments[1].integerValue : -1;
+        if (index < 0 || (NSUInteger)index >= fixtureWindows.count ||
+            ![arguments[1] isEqualToString:[NSString stringWithFormat:@"%ld", (long)index]] ||
+            arguments.count != (front ? 2u : 3u)) {
+            emit(@{@"event": @"error", @"message": front ? @"usage: front INDEX" : @"usage: sticky INDEX on|off"});
             return;
         }
         NSWindow *window = fixtureWindows[(NSUInteger)index];
+        if (front) {
+            [window orderFrontRegardless];
+            emit(@{@"event": @"front", @"window": describeWindow((NSUInteger)index, window)});
+            return;
+        }
+        BOOL on = [arguments[2] isEqualToString:@"on"];
+        BOOL off = [arguments[2] isEqualToString:@"off"];
+        if (!on && !off) {
+            emit(@{@"event": @"error", @"message": @"usage: sticky INDEX on|off"});
+            return;
+        }
         NSWindowCollectionBehavior behavior = window.collectionBehavior;
         if (on) behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces;
         else behavior &= ~NSWindowCollectionBehaviorCanJoinAllSpaces;

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Reproducible per-window "sticky" experiment (NOT a product test).
+"""Reproducible "sticky" experiment (NOT a product test).
 
-The production kit has no sticky command because foreign per-window sticky
-writes were observed not to apply. This runner reproduces that observation
-with disposable fixture windows and reports each attempt as
-applied / not_applied / inconclusive. A negative result is an observation
-about this OS build, not a failure, and is never assumed to hold forever.
+Makes a window of ANOTHER process appear on more than one Desktop and reports
+each attempt as applied / not_applied / inconclusive. A result is an
+observation about this OS build, never assumed to hold forever.
 
 Stages (target T and same-process sibling control C, both owned by the fixture):
 
@@ -16,6 +14,17 @@ Stages (target T and same-process sibling control C, both owned by the fixture):
                    never-joined Desktop and against T's home
   foreign tag      SLSSetWindowTags 0x800 from another process, observed on an
                    existing Desktop, a newly created one, and home; cleared after
+  foreign JOIN     SLSBridgedSpaceAddWindowsAndRemoveFromSpacesOperation with
+                   options 0: existing Desktop, home, and a Desktop created
+                   afterwards (expected not to follow)
+  app-wide assign  SLSBridgedProcessAssignToAllSpacesOperation on the fixture
+                   PID: T and C on an existing and a newly created Desktop;
+                   then SLSBridgedProcessAssignToSpaceOperation with 0 to clear
+  foreign overlay  T placed into an unmanaged Space created with
+                   SLSBridgedSpaceCreateOperation options 1 and raised with
+                   SLSBridgedSpaceSetAbsoluteLevelOperation: visible at home, on
+                   an existing and a newly created Desktop, and still in front of
+                   C after the owner raises C
   owner control    NSWindow.collectionBehavior canJoinAllSpaces set by the owner
                    process (positive control): existing Desktop, newly created
                    Desktop, sibling stays home; then cleared to show where the
@@ -24,10 +33,11 @@ Stages (target T and same-process sibling control C, both owned by the fixture):
 
 Every verdict requires STABLE compositor visibility (CG on-screen flag plus the
 Space census with option 0x2) held for --stable seconds, not merely a dispatch
-or a membership count. Requires --mutate: it activates other Desktops
-temporarily and creates Desktops of its own. Original Desktops are never
-destroyed or reordered; current Spaces are restored; own Spaces are removed in
-a final block that reports every failure.
+or a membership count. Overlay windows belong to no Desktop, so their
+visibility is the on-screen flag alone. Requires --mutate: it activates other
+Desktops temporarily and creates Desktops of its own. Original Desktops are
+never destroyed or reordered; current Spaces are restored; own Spaces and the
+overlay are removed in a final block that reports every failure.
 
 Exit codes: 0 experiment completed (whatever the verdicts), 1 aborted,
 2 prerequisite/usage, 3 cleanup incomplete or baseline not restored.
@@ -41,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probelib as pl  # noqa: E402
 
 STICKY_TAG_HEX = "0x0000000000000800"
+OVERLAY_LEVEL = 20
 
 
 class Experiment:
@@ -53,6 +64,7 @@ class Experiment:
         self.baseline = pl.snapshot_baseline(self.baseline_spaces)
         self.cleanup = pl.Cleanup()
         self.owned = []
+        self.overlays = []
         self.stages = []
         self.verdicts = {}
         self.fixture = None
@@ -136,6 +148,27 @@ class Experiment:
             raise pl.ProbeError("census never showed %s as current" % sid)
         return ms
 
+    def create_overlay(self):
+        """An unmanaged Space above the Desktops; destroyed in cleanup if the run stops early."""
+        try:
+            record = self.observer.overlay_create(OVERLAY_LEVEL)
+        except pl.NskError as exc:
+            if exc.code == "unexpected_space" and exc.space_id and pl.find_space(self.nsk.list(), exc.space_id):
+                self.owned.append(exc.space_id)
+                self.cleanup.push("destroy own Space %s (unexpected overlay)" % exc.space_id,
+                                  lambda sid=exc.space_id: self.destroy_owned(sid))
+            raise
+        sid = record["overlay_id"]
+        self.overlays.append(sid)
+        label = "destroy overlay Space %s" % sid
+        self.cleanup.push(label, lambda: self.observer.overlay_destroy(sid))
+        return sid, label
+
+    def destroy_overlay(self, sid, label):
+        result = self.observer.overlay_destroy(sid)
+        self.cleanup.discard(label)
+        return result
+
     def existing_desktop(self):
         """An ORIGINAL other Desktop on the display if there is one, else an own one."""
         for space in pl.display_spaces(self.baseline_spaces, self.display):
@@ -145,10 +178,12 @@ class Experiment:
 
     # -- measurement ---------------------------------------------------------
     def visibility(self, wid, sid):
-        """Stable compositor visibility of wid while sid is current: stable_visible / stable_hidden / flapping."""
+        """Stable compositor visibility of wid while sid is current: stable_visible / stable_hidden / flapping.
+
+        sid None: the window belongs to no Desktop (overlay), so only the CG on-screen flag counts."""
         def visible():
             w = self.observer.window(wid)
-            return bool(w.get("onscreen") and pl.hosting(w, sid)["up"])
+            return bool(w.get("onscreen") and (sid is None or pl.hosting(w, sid)["up"]))
         reached, settle_ms, _ = pl.wait_for(visible, self.args.settle)
         if reached:
             held, samples, _ = pl.hold_for(visible, self.args.stable)
@@ -156,12 +191,12 @@ class Experiment:
         held, samples, _ = pl.hold_for(lambda: not visible(), self.args.stable)
         return {"visibility": "stable_hidden" if held else "flapping", "settle_ms": settle_ms, "samples": samples}
 
-    def observe(self, stage, focus_space=None, measure=True):
+    def observe(self, stage, focus_space=None, measure=True, overlay=False):
         """Record one stage: current Space, target/control views, and (optionally) target visibility on focus_space."""
         entry = {"stage": stage, "current": pl.active_spaces(self.nsk.list()).get(self.display)}
         if measure:
             focus = focus_space if focus_space is not None else entry["current"]
-            entry["target_visibility"] = self.visibility(self.target, focus)
+            entry["target_visibility"] = self.visibility(self.target, None if overlay else focus)
             entry["control_visibility"] = self.visibility(self.control, focus)
             entry["focus_space"] = focus
         obs = self.observer.observe(self.target, self.control)
@@ -205,6 +240,54 @@ class Experiment:
         else:
             verdict = "inconclusive"
         return {"verdict": verdict, "member": member, "visibility": visibility, "space_id": sid}
+
+    @staticmethod
+    def verdict_app_wide(entry, sid):
+        """Did BOTH fixture windows join sid and stay stably visible there (a process-wide assignment)?"""
+        def member(key):
+            return sid in (entry[key].get("memberships") or [])
+
+        def visibility(key):
+            return entry[key + "_visibility"]["visibility"]
+
+        if all(member(k) and visibility(k) == "stable_visible" for k in ("target", "control")):
+            verdict = "applied"
+        elif all(not member(k) and visibility(k) == "stable_hidden" for k in ("target", "control")):
+            verdict = "not_applied"
+        else:
+            verdict = "inconclusive"
+        return {"verdict": verdict, "space_id": sid,
+                "sticky_bits": [entry["target"].get("sticky_bit"), entry["control"].get("sticky_bit")]}
+
+    def verdict_overlay(self, entry, sid):
+        """Is the target stably on screen while in no Desktop, with the sibling still only at home?"""
+        outside = not (entry["target"].get("memberships") or [])
+        visibility = entry["target_visibility"]["visibility"]
+        if outside and visibility == "stable_visible":
+            verdict = "applied"
+        elif visibility == "stable_hidden":
+            verdict = "not_applied"
+        else:
+            verdict = "inconclusive"
+        sibling_expected = "stable_visible" if sid == self.home else "stable_hidden"
+        sibling_home = ((entry["control"].get("memberships") or []) == [self.home]
+                        and entry["control_visibility"]["visibility"] == sibling_expected)
+        if not sibling_home:
+            verdict = "inconclusive"
+        return {"verdict": verdict, "outside_desktops": outside, "visibility": visibility,
+                "space_id": sid, "sibling_home": sibling_home}
+
+    @staticmethod
+    def target_in_front(entry):
+        target, control = entry["target"].get("onscreen_order"), entry["control"].get("onscreen_order")
+        return None if target is None or control is None else target < control
+
+    def restore_control_home(self):
+        self.nsk.move_window(self.control, self.home)
+        record = self.observer.window(self.control)
+        if record.get("memberships") != [self.home] or record.get("sticky_bit"):
+            raise pl.ProbeError("could not restore the control's non-sticky home baseline")
+        return pl.summarize_window(record)
 
     def reset_target_home(self):
         """Use the cooperating owner only to reset between independent candidates."""
@@ -283,6 +366,67 @@ class Experiment:
         self.report["foreign_tag_off"] = self.observer.tag(self.target, False)
         self.report["baseline_reset_after_tag"] = self.reset_target_home()
 
+        # ---- foreign JOIN (per window, keeps the other memberships) ---------
+        self.report["foreign_join_dispatch"] = self.observer.join(self.target, existing)
+        self.activate(existing)
+        entry = self.observe("after foreign JOIN, existing desktop", focus_space=existing)
+        self.verdicts["foreign_join_existing_desktop"] = self.verdict_join(entry, existing, baseline_bit)
+        self.activate(home)
+        entry = self.observe("after foreign JOIN, home", focus_space=home)
+        self.verdicts["foreign_join_home_intact"] = self.verdict_join(entry, home)
+        future_join = self.create_space("created after foreign JOIN")
+        self.activate(future_join)
+        entry = self.observe("after foreign JOIN, newly created desktop", focus_space=future_join)
+        self.verdicts["foreign_join_future_desktop"] = self.verdict_join(entry, future_join, baseline_bit)
+        self.report["baseline_reset_after_join"] = self.reset_target_home()
+
+        # ---- foreign app-wide assignment (every window of the process) ------
+        pid = self.fixture.pid
+        self.report["foreign_assign_all_dispatch"] = self.observer.assign_all(pid)
+        self.activate(existing)
+        entry = self.observe("after app-wide assignment, existing desktop", focus_space=existing)
+        self.verdicts["foreign_assign_all_existing_desktop"] = self.verdict_app_wide(entry, existing)
+        future_assign = self.create_space("created after app-wide assignment")
+        self.activate(future_assign)
+        entry = self.observe("after app-wide assignment, newly created desktop", focus_space=future_assign)
+        self.verdicts["foreign_assign_all_future_desktop"] = self.verdict_app_wide(entry, future_assign)
+        self.report["foreign_assign_clear_dispatch"] = self.observer.assign(pid, 0)
+        entry = self.observe("app-wide assignment cleared while on new desktop", focus_space=future_assign)
+        pinned = [entry[k].get("memberships") or [] for k in ("target", "control")]
+        self.verdicts["foreign_assign_clear_pins_to"] = {
+            "memberships": pinned,
+            "pinned_to": ("current" if pinned == [[future_assign]] * 2 else
+                          "home" if pinned == [[home]] * 2 else "other"),
+            "sticky_bits": [entry["target"].get("sticky_bit"), entry["control"].get("sticky_bit")],
+        }
+        self.report["control_reset_after_assign"] = self.restore_control_home()
+        self.report["baseline_reset_after_assign"] = self.reset_target_home()
+
+        # ---- foreign overlay: an unmanaged Space above the Desktops ---------
+        self.fixture.front(1)
+        entry = self.observe("control raised before overlay, home", focus_space=home)
+        self.report["overlay_baseline_target_in_front"] = self.target_in_front(entry)
+        overlay, overlay_label = self.create_overlay()
+        self.report["foreign_overlay_place_dispatch"] = self.observer.place(self.target, overlay)
+        entry = self.observe("target in overlay, home", focus_space=home, overlay=True)
+        self.verdicts["foreign_overlay_home"] = self.verdict_overlay(entry, home)
+        self.fixture.front(1)
+        entry = self.observe("target in overlay, control raised by its owner", focus_space=home, overlay=True)
+        self.verdicts["foreign_overlay_stays_in_front"] = {"in_front": self.target_in_front(entry)}
+        self.activate(existing)
+        entry = self.observe("target in overlay, existing desktop", focus_space=existing, overlay=True)
+        self.verdicts["foreign_overlay_existing_desktop"] = self.verdict_overlay(entry, existing)
+        future_overlay = self.create_space("created after overlay")
+        self.activate(future_overlay)
+        entry = self.observe("target in overlay, newly created desktop", focus_space=future_overlay, overlay=True)
+        self.verdicts["foreign_overlay_future_desktop"] = self.verdict_overlay(entry, future_overlay)
+        self.activate(home)
+        self.report["overlay_place_home"] = self.observer.place(self.target, home)
+        if self.observer.window(self.target).get("memberships") != [home]:
+            raise pl.ProbeError("could not move the target out of the overlay")
+        self.report["overlay_destroy"] = self.destroy_overlay(overlay, overlay_label)
+        self.report["baseline_reset_after_overlay"] = self.reset_target_home()
+
         # ---- owner-side positive control -----------------------------------
         self.report["owner_control_on"] = self.fixture.sticky(0, True)
         self.activate(existing)
@@ -340,10 +484,18 @@ class Experiment:
             "foreign_add": self._combine("foreign_add_existing_desktop", "foreign_add_future_desktop"),
             "foreign_remove": self.verdicts["foreign_remove_home"]["verdict"],
             "foreign_tag": self._combine("foreign_tag_existing_desktop", "foreign_tag_future_desktop"),
+            "foreign_join": self.verdicts["foreign_join_existing_desktop"]["verdict"],
+            "foreign_join_follows_new_desktops": self.verdicts["foreign_join_future_desktop"]["verdict"],
+            "foreign_assign_all": self._combine("foreign_assign_all_existing_desktop",
+                                                "foreign_assign_all_future_desktop"),
+            "foreign_assign_clear_pins_to": self.verdicts["foreign_assign_clear_pins_to"]["pinned_to"],
+            "foreign_overlay": self._combine("foreign_overlay_home", "foreign_overlay_existing_desktop",
+                                             "foreign_overlay_future_desktop"),
+            "foreign_overlay_stays_in_front": self.verdicts["foreign_overlay_stays_in_front"]["in_front"],
             "owner_control": self._combine("owner_control_existing_desktop", "owner_control_future_desktop"),
             "owner_unsticky_pins_to": self.verdicts["owner_unsticky_pins_to"]["pinned_to"],
         }
-        for candidate in ("foreign_add", "foreign_tag"):
+        for candidate in ("foreign_add", "foreign_tag", "foreign_join"):
             if self.verdicts[candidate + "_home_intact"]["verdict"] != "applied":
                 self.report["summary"][candidate] = "inconclusive"
 
@@ -399,6 +551,7 @@ def main(argv=None):
         report.data["stages"] = experiment.stages
         report.data["verdicts"] = experiment.verdicts
         report.data["owned_spaces"] = experiment.owned
+        report.data["overlay_spaces"] = experiment.overlays
         try:
             problems = pl.baseline_diff(experiment.baseline, nsk.list())
         except pl.ProbeError as exc:

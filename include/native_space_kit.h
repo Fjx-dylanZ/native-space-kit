@@ -4,12 +4,13 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define NSK_VERSION "0.2.0"
+#define NSK_VERSION "0.3.0"
 #define NSK_EXPORT __attribute__((visibility("default")))
 
 typedef uint64_t nsk_space_id;
@@ -56,6 +57,8 @@ typedef struct {
     bool activate_space;
     bool move_window;
     bool reorder_spaces;
+    bool add_window;
+    bool assign_process;
 } nsk_capabilities;
 
 typedef enum {
@@ -111,11 +114,36 @@ NSK_EXPORT nsk_status nsk_activate_space(nsk_space_id space, nsk_error *error);
  */
 NSK_EXPORT nsk_status nsk_destroy_space(nsk_space_id space, uint32_t options, nsk_error *error);
 
-/* Ordinary single-Space windows and ordinary destination Desktops only. Does not
- * deliberately activate the destination. Fullscreen/sticky-window moves are outside
- * the verified contract and are refused when identifiable from native membership.
+/* Ordinary application windows on one or more ordinary Desktops, and ordinary destination
+ * Desktops only. A window on several Desktops (see nsk_add_window_to_space) ends up on the
+ * destination alone. Does not deliberately activate the destination. Sticky windows
+ * (canJoinAllSpaces or an app assignment) and windows on fullscreen or system Spaces are
+ * refused.
  */
 NSK_EXPORT nsk_status nsk_move_window(nsk_window_id window, nsk_space_id destination, nsk_error *error);
+
+/* Also show an ordinary application window on another ordinary Desktop of the same
+ * display, keeping its current Desktops. Repeat per Desktop; the window does not join
+ * Desktops created later. nsk_move_window returns it to a single Desktop. Sticky windows
+ * are refused.
+ */
+NSK_EXPORT nsk_status nsk_add_window_to_space(nsk_window_id window, nsk_space_id space, nsk_error *error);
+
+/* Process-wide assignment, like the Dock's "Assign To" menu, for every current and
+ * future window of pid. Not saved: it ends when the process exits. Confirmed against
+ * the process's application windows on ordinary Desktops; a process without such a
+ * window is refused with NSK_NOT_FOUND.
+ *   to_all_spaces: every Desktop, including Desktops created later.
+ *   to_space:      one ordinary Desktop; existing windows move there, new windows open
+ *                  there. Every window must be on that Desktop's display.
+ *   clear:         no assignment. Windows stay where they are, except that windows on
+ *                  every Desktop of their display stay only on its current Desktop. A
+ *                  window that is sticky through its app's own setting stays on every
+ *                  Desktop, and the call reports NSK_NOT_CONFIRMED.
+ */
+NSK_EXPORT nsk_status nsk_assign_process_to_all_spaces(pid_t pid, nsk_error *error);
+NSK_EXPORT nsk_status nsk_assign_process_to_space(pid_t pid, nsk_space_id space, nsk_error *error);
+NSK_EXPORT nsk_status nsk_clear_process_assignment(pid_t pid, nsk_error *error);
 
 /* Same-display, ordinary-Desktop-only layouts. Move places source at target's
  * ORIGINAL position; intervening entries shift. Swap preserves other positions.

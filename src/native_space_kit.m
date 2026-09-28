@@ -13,8 +13,10 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +29,14 @@ static SEL g_perform;
 static CFArrayRef (*g_copyManagedSpaces)(int);
 static CFArrayRef (*g_copyWindows)(int, uint32_t, CFArrayRef, uint32_t, uint64_t *, uint64_t *);
 static CFArrayRef (*g_copySpacesForWindows)(int, int, CFArrayRef);
+static CFTypeRef (*g_queryWindows)(int, CFArrayRef, int);
+static CFTypeRef (*g_queryCopyWindows)(CFTypeRef);
+static bool (*g_iteratorAdvance)(CFTypeRef);
+static uint32_t (*g_iteratorWindowID)(CFTypeRef);
+static uint64_t (*g_iteratorTags)(CFTypeRef);
+
+// Window server tag set by canJoinAllSpaces and by app-wide assignment.
+static const uint64_t kStickyTag = 0x800;
 
 // Verified WMBridge operation ABIs. init_arguments holds one Objective-C type code per
 // argument; perform_result is "v" for asynchronous and "@" for synchronous operations.
@@ -46,6 +56,14 @@ static const nsk_operation kSetCurrent = {"SLSBridgedManagedDisplaySetCurrentSpa
 static const nsk_operation kMoveWindows = {"SLSBridgedMoveWindowsToManagedSpaceOperation", "initWithWindows:spaceID:", "@Q", "v"};
 static const nsk_operation kReorder = {"SLSBridgedMoveManagedSpaceToDisplayIndexOperation",
                                        "initWithSpaceID:displayIdentifier:index:", "Q@I", "v"};
+static const nsk_operation kAddWindows = {"SLSBridgedSpaceAddWindowsAndRemoveFromSpacesOperation",
+                                          "initWithSpaceID:windows:options:", "Q@I", "v"};
+static const nsk_operation kAssignAll = {"SLSBridgedProcessAssignToAllSpacesOperation", "initWithProcess:", "i", "v"};
+static const nsk_operation kAssignSpace = {"SLSBridgedProcessAssignToSpaceOperation", "initWithProcess:spaceID:", "iQ", "v"};
+
+// kAddWindows options 0 adds the windows and keeps their other memberships. Values with
+// bits 0x1 and 0x4 also remove them from every other Space; the kit never sends those.
+static const uint32_t kAddKeepMemberships = 0;
 
 // MARK: - Errors and preconditions
 
@@ -303,6 +321,114 @@ static nsk_status copy_application_windows(nsk_space_id space, NSArray **out, ns
     return NSK_OK;
 }
 
+// The display whose ordinary Desktops hold every membership; nil when a membership is not an
+// ordinary Desktop in the census or the memberships span displays.
+static NSString *desktop_display(NSArray *spaces, NSArray *memberships) {
+    NSString *display = nil;
+    for (NSNumber *member in memberships) {
+        NSDictionary *record = find_space(spaces, member.unsignedLongLongValue);
+        if (!record || space_type(record) != 0) return nil;
+        if (display && ![display isEqual:record[@"display"]]) return nil;
+        display = record[@"display"];
+    }
+    return display;
+}
+
+static NSSet *display_desktops(NSArray *spaces, NSString *display) {
+    NSMutableSet *desktops = [NSMutableSet set];
+    for (NSDictionary *record in spaces)
+        if (space_type(record) == 0 && [record[@"display"] isEqual:display]) [desktops addObject:record[@"id"]];
+    return desktops;
+}
+
+static NSDictionary *current_space(NSArray *spaces, NSString *display) {
+    for (NSDictionary *record in spaces)
+        if (space_active(record) && [record[@"display"] isEqual:display]) return record;
+    return nil;
+}
+
+static nsk_status require_application_window(nsk_window_id window, nsk_space_id space, nsk_error *error) {
+    NSArray *metadata = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID));
+    NSNumber *layer = metadata ? window_layer(metadata, @(window)) : nil;
+    if (!layer) return fail(error, NSK_QUERY_FAILED, space, window, "Window metadata is unavailable; refusing to change an unclassified window.");
+    if (!application_layer(layer))
+        return fail(error, NSK_UNSUPPORTED_WINDOW, space, window, "Only normal, floating, and modal application windows (levels 0, 3, 8) are supported.");
+    return NSK_OK;
+}
+
+// 1 if the window carries the sticky tag, 0 if not, -1 when the tag cannot be read.
+static int window_sticky(nsk_window_id window) {
+    if (!g_queryWindows || !g_queryCopyWindows || !g_iteratorAdvance || !g_iteratorWindowID || !g_iteratorTags) return -1;
+    CFTypeRef query = g_queryWindows(g_connection, (__bridge CFArrayRef)window_list(window), 1);
+    if (!query) return -1;
+    CFTypeRef iterator = g_queryCopyWindows(query);
+    int sticky = -1;
+    while (iterator && g_iteratorAdvance(iterator)) {
+        if (g_iteratorWindowID(iterator) != window) continue;
+        sticky = (g_iteratorTags(iterator) & kStickyTag) != 0;
+        break;
+    }
+    if (iterator) CFRelease(iterator);
+    CFRelease(query);
+    return sticky;
+}
+
+// Memberships of an application window that must sit on ordinary Desktops of one display
+// and must not be sticky: the window server keeps sticky windows on every Desktop, so moves
+// and additions do not apply to them.
+static nsk_status require_desktop_window(NSArray *spaces, nsk_window_id window, nsk_space_id space,
+                                         NSArray **memberships, NSString **display, nsk_error *error) {
+    NSArray *current = window_memberships(window);
+    if (!current) return fail(error, NSK_QUERY_FAILED, space, window, "Could not read the window's Space memberships.");
+    if (!current.count) return fail(error, NSK_NOT_FOUND, space, window, "The window has no managed Space membership; it may not exist.");
+    NSString *home = desktop_display(spaces, current);
+    if (!home)
+        return fail(error, NSK_UNSUPPORTED_WINDOW, space, window,
+                    "The window is on a fullscreen or system Space, or on Desktops of several displays.");
+    nsk_status status = require_application_window(window, space, error);
+    if (status) return status;
+    int sticky = window_sticky(window);
+    if (sticky == 1)
+        return fail(error, NSK_UNSUPPORTED_WINDOW, space, window,
+                    "The window is sticky through its app's own setting or an app assignment; clear the assignment first.");
+    if (sticky < 0 && current.count > 1)
+        return fail(error, NSK_UNSUPPORTED_WINDOW, space, window,
+                    "The window is on several Desktops and its sticky state cannot be read; refusing.");
+    *memberships = current;
+    *display = home;
+    return NSK_OK;
+}
+
+// Application windows (levels 0, 3, 8) of pid on managed Spaces: window ID -> @{memberships,
+// display}. Windows on no managed Space are skipped; any on another kind of Space fails closed.
+static nsk_status copy_process_windows(pid_t pid, NSArray *spaces, nsk_space_id space, NSDictionary **out, nsk_error *error) {
+    NSArray *metadata = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID));
+    if (!metadata) return fail(error, NSK_QUERY_FAILED, space, 0, "Could not list the process's windows.");
+    NSMutableDictionary *windows = [NSMutableDictionary dictionary];
+    for (NSDictionary *info in metadata) {
+        NSNumber *owner = info[(id)kCGWindowOwnerPID];
+        if (![owner isKindOfClass:[NSNumber class]] || owner.intValue != pid) continue;
+        NSNumber *number = info[(id)kCGWindowNumber], *layer = info[(id)kCGWindowLayer];
+        if (![number isKindOfClass:[NSNumber class]] || ![layer isKindOfClass:[NSNumber class]])
+            return fail(error, NSK_QUERY_FAILED, space, 0, "Some window metadata is unavailable; refusing to classify the process's windows.");
+        if (!application_layer(layer)) continue;
+        nsk_window_id window = number.unsignedIntValue;
+        NSArray *memberships = window_memberships(window);
+        if (!memberships) return fail(error, NSK_QUERY_FAILED, space, window, "Could not read the memberships of the process's windows.");
+        if (!memberships.count) continue;
+        NSString *display = desktop_display(spaces, memberships);
+        if (!display)
+            return fail(error, NSK_UNSUPPORTED_WINDOW, space, window,
+                        "The process has a window on a fullscreen or system Space, or on several displays.");
+        windows[@(window)] = @{@"memberships": memberships, @"display": display};
+    }
+    if (!windows.count)
+        return fail(error, NSK_NOT_FOUND, space, 0,
+                    "Process %d has no application windows on ordinary Desktops to confirm an assignment with.", (int)pid);
+    *out = windows;
+    return NSK_OK;
+}
+
 // MARK: - Operations
 
 static nsk_status initialize(nsk_error *error) {
@@ -319,6 +445,11 @@ static nsk_status initialize(nsk_error *error) {
     g_copyManagedSpaces = dlsym(skylight, "SLSCopyManagedDisplaySpaces");
     g_copyWindows = dlsym(skylight, "SLSCopyWindowsWithOptionsAndTags");
     g_copySpacesForWindows = dlsym(skylight, "SLSCopySpacesForWindows");
+    g_queryWindows = dlsym(skylight, "SLSWindowQueryWindows");
+    g_queryCopyWindows = dlsym(skylight, "SLSWindowQueryResultCopyWindows");
+    g_iteratorAdvance = dlsym(skylight, "SLSWindowIteratorAdvance");
+    g_iteratorWindowID = dlsym(skylight, "SLSWindowIteratorGetWindowID");
+    g_iteratorTags = dlsym(skylight, "SLSWindowIteratorGetTags");
     if (!mainConnection || !g_copyManagedSpaces) return fail(error, NSK_UNSUPPORTED, 0, 0, "The native Space census APIs are unavailable.");
     g_connection = mainConnection();
     if (!g_connection) return fail(error, NSK_NO_GUI_SESSION, 0, 0, "No window server connection is available.");
@@ -340,6 +471,9 @@ static nsk_status get_capabilities(nsk_capabilities *out, nsk_error *error) {
                           resolve_operation(&kSetCurrent) != Nil;
     out->move_window = resolve_operation(&kMoveWindows) != Nil && g_copySpacesForWindows != NULL;
     out->reorder_spaces = resolve_operation(&kReorder) != Nil;
+    out->add_window = resolve_operation(&kAddWindows) != Nil && g_copySpacesForWindows != NULL;
+    out->assign_process = resolve_operation(&kAssignAll) != Nil && resolve_operation(&kAssignSpace) != Nil &&
+                          g_copySpacesForWindows != NULL;
     return succeed(error);
 }
 
@@ -509,22 +643,10 @@ static nsk_status move_window(nsk_window_id window, nsk_space_id destination, ns
     NSDictionary *target = find_space(before, destination);
     if (!target) return fail(error, NSK_NOT_FOUND, destination, window, "No managed Space has that native ID; Desktop numbers are not IDs.");
     if (space_type(target) != 0) return fail(error, NSK_NOT_DESKTOP, destination, window, "Windows can only be moved to ordinary Desktops.");
-    NSArray *memberships = window_memberships(window);
-    if (!memberships) return fail(error, NSK_QUERY_FAILED, destination, window, "Could not read the window's Space memberships.");
-    if (!memberships.count) return fail(error, NSK_NOT_FOUND, destination, window, "The window has no managed Space membership; it may not exist.");
-    if (memberships.count != 1)
-        return fail(error, NSK_UNSUPPORTED_WINDOW, destination, window,
-                    "The window belongs to %lu Spaces; sticky and multi-Space windows are outside the verified contract.",
-                    (unsigned long)memberships.count);
-    NSDictionary *source = find_space(before, [memberships[0] unsignedLongLongValue]);
-    if (!source || space_type(source) != 0)
-        return fail(error, NSK_UNSUPPORTED_WINDOW, destination, window, "The window's current Space is not an ordinary Desktop (fullscreen or system Space).");
-    NSArray *metadata = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID));
-    NSNumber *layer = metadata ? window_layer(metadata, @(window)) : nil;
-    if (!layer) return fail(error, NSK_QUERY_FAILED, destination, window, "Window metadata is unavailable; refusing to move an unclassified window.");
-    if (!application_layer(layer))
-        return fail(error, NSK_UNSUPPORTED_WINDOW, destination, window, "Only normal, floating, and modal application windows (levels 0, 3, 8) can be moved.");
-    if ([source[@"id"] unsignedLongLongValue] == destination) return succeed(error);
+    NSArray *memberships = nil;
+    NSString *display = nil;
+    if ((status = require_desktop_window(before, window, destination, &memberships, &display, error))) return status;
+    if (memberships.count == 1 && [memberships[0] unsignedLongLongValue] == destination) return succeed(error);
     id operation = (__bridge_transfer id)((CFTypeRef (*)(CFTypeRef, SEL, id, uint64_t))objc_msgSend)(
         allocate(cls), sel_registerName(kMoveWindows.init_selector), window_list(window), destination);
     if (!operation) return fail(error, NSK_OPERATION_FAILED, destination, window, "Could not initialize the native window move operation.");
@@ -537,6 +659,129 @@ static nsk_status move_window(nsk_window_id window, nsk_space_id destination, ns
     if (status == NSK_NOT_CONFIRMED)
         return fail(error, NSK_NOT_CONFIRMED, destination, window,
                     "The window was not observed on the destination Space within 2 seconds. Check its memberships before retrying.");
+    return status ? status : succeed(error);
+}
+
+static nsk_status add_window_to_space(nsk_window_id window, nsk_space_id space, nsk_error *error) {
+    nsk_status status = begin(error);
+    if (status) return status;
+    if (!window || !space) return fail(error, NSK_INVALID_ARGUMENT, 0, 0, "Window and Space IDs must be nonzero.");
+    if ((status = require_mutation(error))) return status;
+    if (!g_copySpacesForWindows)
+        return fail(error, NSK_UNSUPPORTED, space, window, "Window membership queries are unavailable; additions cannot be verified.");
+    Class cls = resolve_operation(&kAddWindows);
+    if (!cls) return fail(error, NSK_UNSUPPORTED, space, window, "Adding windows to Spaces is unavailable or its ABI changed.");
+    NSArray *before = read_spaces();
+    if (!before) return fail(error, NSK_QUERY_FAILED, space, window, "Could not read managed Spaces.");
+    NSDictionary *target = find_space(before, space);
+    if (!target) return fail(error, NSK_NOT_FOUND, space, window, "No managed Space has that native ID; Desktop numbers are not IDs.");
+    if (space_type(target) != 0) return fail(error, NSK_NOT_DESKTOP, space, window, "Windows can only be added to ordinary Desktops.");
+    NSArray *memberships = nil;
+    NSString *display = nil;
+    if ((status = require_desktop_window(before, window, space, &memberships, &display, error))) return status;
+    if (![target[@"display"] isEqual:display])
+        return fail(error, NSK_DIFFERENT_DISPLAYS, space, window, "The window's Desktops are on another display.");
+    if ([memberships containsObject:@(space)]) return succeed(error);
+    NSSet *expected = [[NSSet setWithArray:memberships] setByAddingObject:@(space)];
+    id operation = (__bridge_transfer id)((CFTypeRef (*)(CFTypeRef, SEL, uint64_t, id, uint32_t))objc_msgSend)(
+        allocate(cls), sel_registerName(kAddWindows.init_selector), space, window_list(window), kAddKeepMemberships);
+    if (!operation) return fail(error, NSK_OPERATION_FAILED, space, window, "Could not initialize the native add-window operation.");
+    perform_async(operation, error);
+    status = confirm(^nsk_status(void) {
+        NSArray *now = window_memberships(window);
+        if (!now) return fail(error, NSK_QUERY_FAILED, space, window, "The addition was requested, but the window's memberships could not be read.");
+        return [[NSSet setWithArray:now] isEqualToSet:expected] ? NSK_OK : NSK_NOT_CONFIRMED;
+    });
+    if (status == NSK_NOT_CONFIRMED)
+        return fail(error, NSK_NOT_CONFIRMED, space, window,
+                    "The window was not observed on the added Space within 2 seconds. Check its memberships before retrying.");
+    return status ? status : succeed(error);
+}
+
+typedef enum { ASSIGN_ALL_SPACES, ASSIGN_SPACE, ASSIGN_NONE } assign_mode;
+
+static nsk_status assign_process(pid_t pid, assign_mode mode, nsk_space_id space, nsk_error *error) {
+    nsk_status status = begin(error);
+    if (status) return status;
+    if (pid <= 0) return fail(error, NSK_INVALID_ARGUMENT, 0, 0, "Process ID must be positive.");
+    if (mode == ASSIGN_SPACE && !space) return fail(error, NSK_INVALID_ARGUMENT, 0, 0, "Space ID must be nonzero.");
+    if ((status = require_mutation(error))) return status;
+    if (kill(pid, 0) != 0 && errno == ESRCH) return fail(error, NSK_NOT_FOUND, space, 0, "No process has ID %d.", (int)pid);
+    if (!g_copySpacesForWindows)
+        return fail(error, NSK_UNSUPPORTED, space, 0, "Window membership queries are unavailable; assignments cannot be verified.");
+    Class cls = resolve_operation(mode == ASSIGN_ALL_SPACES ? &kAssignAll : &kAssignSpace);
+    if (!cls) return fail(error, NSK_UNSUPPORTED, space, 0, "Process assignment is unavailable or its ABI changed.");
+    NSArray *before = read_spaces();
+    if (!before) return fail(error, NSK_QUERY_FAILED, space, 0, "Could not read managed Spaces.");
+    NSDictionary *target = nil;
+    if (mode == ASSIGN_SPACE) {
+        target = find_space(before, space);
+        if (!target) return fail(error, NSK_NOT_FOUND, space, 0, "No managed Space has that native ID; Desktop numbers are not IDs.");
+        if (space_type(target) != 0) return fail(error, NSK_NOT_DESKTOP, space, 0, "Processes can only be assigned to ordinary Desktops.");
+    }
+    NSDictionary *windows = nil;
+    if ((status = copy_process_windows(pid, before, space, &windows, error))) return status;
+
+    // The memberships each window must reach: every Desktop of its display (a subset check,
+    // since later Desktops also count), exactly the target, or, when clearing, unchanged except
+    // that windows on every Desktop keep only the display's current one.
+    NSMutableDictionary<NSNumber *, NSSet *> *expected = [NSMutableDictionary dictionaryWithCapacity:windows.count];
+    for (NSNumber *windowID in windows) {
+        NSString *display = windows[windowID][@"display"];
+        NSSet *memberships = [NSSet setWithArray:windows[windowID][@"memberships"]];
+        NSSet *desktops = display_desktops(before, display);
+        if (mode == ASSIGN_ALL_SPACES) {
+            expected[windowID] = desktops;
+        } else if (mode == ASSIGN_SPACE) {
+            if (![display isEqual:target[@"display"]])
+                return fail(error, NSK_DIFFERENT_DISPLAYS, space, windowID.unsignedIntValue,
+                            "The process has a window on another display than the target Desktop.");
+            expected[windowID] = [NSSet setWithObject:@(space)];
+        } else if (desktops.count > 1 && [desktops isSubsetOfSet:memberships]) {
+            NSDictionary *current = current_space(before, display);
+            if (!current || space_type(current) != 0)
+                return fail(error, NSK_UNSUPPORTED_LAYOUT, space, windowID.unsignedIntValue,
+                            "The display's current Space is not an ordinary Desktop.");
+            expected[windowID] = [NSSet setWithObject:current[@"id"]];
+        } else {
+            expected[windowID] = memberships;
+        }
+    }
+
+    SEL initializer = sel_registerName(mode == ASSIGN_ALL_SPACES ? kAssignAll.init_selector : kAssignSpace.init_selector);
+    id operation = mode == ASSIGN_ALL_SPACES
+        ? (__bridge_transfer id)((CFTypeRef (*)(CFTypeRef, SEL, int))objc_msgSend)(allocate(cls), initializer, pid)
+        : (__bridge_transfer id)((CFTypeRef (*)(CFTypeRef, SEL, int, uint64_t))objc_msgSend)(
+              allocate(cls), initializer, pid, mode == ASSIGN_SPACE ? space : 0);
+    if (!operation) return fail(error, NSK_OPERATION_FAILED, space, 0, "Could not initialize the native assignment operation.");
+    perform_async(operation, error);
+    __block nsk_window_id pending = 0;
+    status = confirm(^nsk_status(void) {
+        pending = 0;
+        for (NSNumber *windowID in expected) {
+            NSArray *now = window_memberships(windowID.unsignedIntValue);
+            if (!now)
+                return fail(error, NSK_QUERY_FAILED, space, windowID.unsignedIntValue,
+                            "The assignment was requested, but window memberships could not be read.");
+            if (!now.count) continue;  // closed since the snapshot
+            NSSet *have = [NSSet setWithArray:now];
+            bool reached = mode == ASSIGN_ALL_SPACES ? [expected[windowID] isSubsetOfSet:have] : [have isEqualToSet:expected[windowID]];
+            if (!reached) {
+                pending = windowID.unsignedIntValue;
+                return NSK_NOT_CONFIRMED;
+            }
+        }
+        return NSK_OK;
+    });
+    if (status == NSK_NOT_CONFIRMED) {
+        if (mode == ASSIGN_NONE && window_sticky(pending) == 1)
+            return fail(error, NSK_NOT_CONFIRMED, space, pending,
+                        "Window %" PRIu32 " of process %d is still on every Desktop. Clearing an assignment does not change "
+                        "windows that are sticky through their app's own setting.", pending, (int)pid);
+        return fail(error, NSK_NOT_CONFIRMED, space, pending,
+                    "Window %" PRIu32 " of process %d did not reach its assigned Desktops within 2 seconds. Check its memberships before retrying.",
+                    pending, (int)pid);
+    }
     return status ? status : succeed(error);
 }
 
@@ -690,6 +935,22 @@ nsk_status nsk_destroy_space(nsk_space_id space, uint32_t options, nsk_error *er
 
 nsk_status nsk_move_window(nsk_window_id window, nsk_space_id destination, nsk_error *error) {
     return guarded(error, ^nsk_status(void) { return move_window(window, destination, error); });
+}
+
+nsk_status nsk_add_window_to_space(nsk_window_id window, nsk_space_id space, nsk_error *error) {
+    return guarded(error, ^nsk_status(void) { return add_window_to_space(window, space, error); });
+}
+
+nsk_status nsk_assign_process_to_all_spaces(pid_t pid, nsk_error *error) {
+    return guarded(error, ^nsk_status(void) { return assign_process(pid, ASSIGN_ALL_SPACES, 0, error); });
+}
+
+nsk_status nsk_assign_process_to_space(pid_t pid, nsk_space_id space, nsk_error *error) {
+    return guarded(error, ^nsk_status(void) { return assign_process(pid, ASSIGN_SPACE, space, error); });
+}
+
+nsk_status nsk_clear_process_assignment(pid_t pid, nsk_error *error) {
+    return guarded(error, ^nsk_status(void) { return assign_process(pid, ASSIGN_NONE, 0, error); });
 }
 
 nsk_status nsk_move_space(nsk_space_id source, nsk_space_id target, nsk_error *error) {
