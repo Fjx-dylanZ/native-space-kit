@@ -114,11 +114,13 @@ NSK_EXPORT nsk_status nsk_activate_space(nsk_space_id space, nsk_error *error);
  */
 NSK_EXPORT nsk_status nsk_destroy_space(nsk_space_id space, uint32_t options, nsk_error *error);
 
-/* Ordinary application windows on one or more ordinary Desktops, and ordinary destination
- * Desktops only. A window on several Desktops (see nsk_add_window_to_space) ends up on the
+/* Move an ordinary application window to an ordinary Desktop.
+ * A window on several Desktops (see nsk_add_window_to_space) ends up on the
  * destination alone. Does not deliberately activate the destination. Sticky windows
- * (canJoinAllSpaces or an app assignment) and windows on fullscreen or system Spaces are
- * refused.
+ * (canJoinAllSpaces or an app assignment) and windows on system Spaces are refused.
+ * A non-owning window on a single fullscreen Space may also move out when its sole
+ * fullscreen owner is identifiable. Fullscreen owners, Split View, and unknown owner
+ * metadata are refused. Destinations must still be ordinary Desktops.
  */
 NSK_EXPORT nsk_status nsk_move_window(nsk_window_id window, nsk_space_id destination, nsk_error *error);
 

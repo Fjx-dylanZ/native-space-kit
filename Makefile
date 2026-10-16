@@ -46,6 +46,7 @@ LIB      := $(BUILD)/libnative-space-kit.a
 CLI      := $(BUILD)/nsk
 EXAMPLE  := $(BUILD)/list-spaces
 CONTRACT := $(BUILD)/contract-test
+WINDOW_SOURCE := $(BUILD)/window-source-test
 FIXTURE  := $(BUILD)/window-fixture
 STICKY   := $(BUILD)/sticky-probe
 HEADER   := include/native_space_kit.h
@@ -88,11 +89,15 @@ $(BUILD)/contract.o: tests/contract.c $(HEADER) | $(BUILD)
 $(CONTRACT): $(BUILD)/contract.o $(LIB)
 	$(CC) $(ALL_LDFLAGS) $^ -o $@
 
+$(WINDOW_SOURCE): tests/window_source_test.m src/native_space_kit.m $(HEADER) | $(BUILD)
+	$(CC) $(ALL_OBJCFLAGS) $(LDFLAGS) $(FRAMEWORKS) $< -o $@
+
 # Read-only: the ABI test only initializes and queries; the CLI test runs
 # --version/--help/capabilities/list plus argument-rejection cases. Neither
 # ever submits a native write.
-check: $(CONTRACT) $(CLI) $(EXAMPLE)
+check: $(CONTRACT) $(CLI) $(EXAMPLE) $(WINDOW_SOURCE)
 	$(CONTRACT)
+	$(WINDOW_SOURCE)
 	$(PYTHON) tests/cli_test.py $(CLI)
 	$(PYTHON) tests/probe_test.py
 

@@ -142,7 +142,29 @@ is not activated and the window's frame is unchanged. Membership is read with
 `SLSCopySpacesForWindows(cid, 7, [wid])` and cross-checked with the per-Space
 census. For a sticky window (tag `0x800`) the move is not applied: it stays on
 every Desktop. The kit therefore reads the tag through `SLSWindowQueryWindows`
-and refuses sticky windows, as well as windows on fullscreen or system Spaces.
+and refuses sticky windows and windows on system Spaces.
+
+### Guest windows in fullscreen Spaces
+
+On macOS 27.2 (26B5112a, Apple Silicon), an ordinary Siri window sharing
+Infuse's single-owner fullscreen Space was correctly reported there by both
+`window-spaces` and the per-Space census. The old Desktop-only source guard
+refused to move it. The native move operation successfully returned Siri to
+an inactive ordinary Desktop without moving Infuse or activating either Space.
+
+The guard now accepts this case only when the native Space's `fs_wid` agrees
+with both `fs_wid` and `TileWindowID` of its sole `TileSpaces` entry, and the
+requested window is not that owner. Missing or conflicting owner metadata,
+Split View, mixed memberships, sticky windows, and non-Desktop destinations
+remain refused. `add-window` and process assignments retain their existing guards.
+
+The regression was staged with `sticky-probe place` on the actual Siri window
+and an inactive Infuse fullscreen Space, then checked with `observe` before
+and after `move-window`. The fullscreen owner was separately refused before
+dispatch. This verifies same-display membership and compositor hosting; it
+does not establish cross-display moves from fullscreen, Split View, or general
+focus/input isolation. SIP was already disabled and was not changed for this
+test. Pure owner-metadata tests run as part of `make check`.
 
 ## 6. Reordering (Verified)
 
