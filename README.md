@@ -12,8 +12,10 @@ change in any macOS update.
 ## Compatibility
 
 Tested on macOS 27 (build 26A428) on Apple Silicon with SIP enabled, using one
-display with ordinary Desktops. Other macOS versions, multiple displays, and
-fullscreen Spaces are untested.
+display with ordinary Desktops. Moving a guest window out of a single-owner
+fullscreen Space was also verified on macOS 27.2 (26B5112a); see
+[findings §5](docs/findings.md#5-window-moves-verified) for the limits. Other
+versions and broader multiple-display or fullscreen operations remain untested.
 
 | Operation | Command | Status |
 | --- | --- | --- |
@@ -93,6 +95,9 @@ arguments and 1 otherwise. See `nsk --help`.
   were on every Desktop stay on the current one. Nothing is saved, and the app
   needs at least one window. `PID` is the app's process ID, for example from
   `pgrep -x TextEdit`.
+- `move-window` can also move an ordinary guest window (such as Siri) out of a
+  single-owner fullscreen Space. It refuses the fullscreen owner, Split View,
+  and unknown owner metadata; the destination must still be an ordinary Desktop.
 - `move-window` and `add-window` refuse sticky windows, whether sticky through
   `assign` or the app's own setting.
 

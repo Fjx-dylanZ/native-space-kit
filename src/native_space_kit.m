@@ -334,6 +334,41 @@ static NSString *desktop_display(NSArray *spaces, NSArray *memberships) {
     return display;
 }
 
+// A fullscreen Space can also host ordinary windows (for example Siri over a video).
+// Only the verified single-owner layout is supported; Split View and unknown metadata fail closed.
+static bool fullscreen_guest(NSDictionary *space, nsk_window_id window) {
+    if (![space isKindOfClass:[NSDictionary class]] ||
+        !integer_number(space[@"type"]) || ![space[@"type"] isEqual:@4]) return false;
+    NSNumber *owner = space[@"fs_wid"];
+    if (!integer_number(owner) || owner.longLongValue <= 0 || owner.unsignedLongLongValue > UINT32_MAX ||
+        owner.unsignedIntValue == window) return false;
+    NSDictionary *layout = space[@"TileLayoutManager"];
+    if (![layout isKindOfClass:[NSDictionary class]]) return false;
+    NSArray *tiles = layout[@"TileSpaces"];
+    if (![tiles isKindOfClass:[NSArray class]] || tiles.count != 1) return false;
+    NSDictionary *tile = tiles[0];
+    return [tile isKindOfClass:[NSDictionary class]] &&
+           integer_number(tile[@"fs_wid"]) && [tile[@"fs_wid"] isEqual:owner] &&
+           integer_number(tile[@"TileWindowID"]) && [tile[@"TileWindowID"] isEqual:owner];
+}
+
+static bool can_leave_fullscreen(NSDictionary *source, nsk_window_id window) {
+    if (!source || space_type(source) != 4) return false;
+    NSArray *displays = CFBridgingRelease(g_copyManagedSpaces(g_connection));
+    if (![displays isKindOfClass:[NSArray class]]) return false;
+    for (NSDictionary *display in displays) {
+        if (![display isKindOfClass:[NSDictionary class]] ||
+            ![display[@"Display Identifier"] isEqual:source[@"display"]]) continue;
+        NSArray *spaces = display[@"Spaces"];
+        if (![spaces isKindOfClass:[NSArray class]]) return false;
+        for (NSDictionary *space in spaces) {
+            if ([space isKindOfClass:[NSDictionary class]] && [space[@"id64"] isEqual:source[@"id"]])
+                return fullscreen_guest(space, window);
+        }
+    }
+    return false;
+}
+
 static NSSet *display_desktops(NSArray *spaces, NSString *display) {
     NSMutableSet *desktops = [NSMutableSet set];
     for (NSDictionary *record in spaces)
@@ -373,18 +408,22 @@ static int window_sticky(nsk_window_id window) {
     return sticky;
 }
 
-// Memberships of an application window that must sit on ordinary Desktops of one display
-// and must not be sticky: the window server keeps sticky windows on every Desktop, so moves
-// and additions do not apply to them.
+// Moves may also rescue a guest window from a single fullscreen Space. Additions still
+// require ordinary Desktops of one display. Sticky windows cannot be moved or added.
 static nsk_status require_desktop_window(NSArray *spaces, nsk_window_id window, nsk_space_id space,
-                                         NSArray **memberships, NSString **display, nsk_error *error) {
+                                         bool allowFullscreenGuest, NSArray **memberships, NSString **display,
+                                         nsk_error *error) {
     NSArray *current = window_memberships(window);
     if (!current) return fail(error, NSK_QUERY_FAILED, space, window, "Could not read the window's Space memberships.");
     if (!current.count) return fail(error, NSK_NOT_FOUND, space, window, "The window has no managed Space membership; it may not exist.");
     NSString *home = desktop_display(spaces, current);
+    if (!home && allowFullscreenGuest && current.count == 1) {
+        NSDictionary *source = find_space(spaces, [current[0] unsignedLongLongValue]);
+        if (can_leave_fullscreen(source, window)) home = source[@"display"];
+    }
     if (!home)
         return fail(error, NSK_UNSUPPORTED_WINDOW, space, window,
-                    "The window is on a fullscreen or system Space, or on Desktops of several displays.");
+                    "The window is on an unsupported fullscreen or system Space, or on Desktops of several displays.");
     nsk_status status = require_application_window(window, space, error);
     if (status) return status;
     int sticky = window_sticky(window);
@@ -645,7 +684,7 @@ static nsk_status move_window(nsk_window_id window, nsk_space_id destination, ns
     if (space_type(target) != 0) return fail(error, NSK_NOT_DESKTOP, destination, window, "Windows can only be moved to ordinary Desktops.");
     NSArray *memberships = nil;
     NSString *display = nil;
-    if ((status = require_desktop_window(before, window, destination, &memberships, &display, error))) return status;
+    if ((status = require_desktop_window(before, window, destination, true, &memberships, &display, error))) return status;
     if (memberships.count == 1 && [memberships[0] unsignedLongLongValue] == destination) return succeed(error);
     id operation = (__bridge_transfer id)((CFTypeRef (*)(CFTypeRef, SEL, id, uint64_t))objc_msgSend)(
         allocate(cls), sel_registerName(kMoveWindows.init_selector), window_list(window), destination);
@@ -678,7 +717,7 @@ static nsk_status add_window_to_space(nsk_window_id window, nsk_space_id space, 
     if (space_type(target) != 0) return fail(error, NSK_NOT_DESKTOP, space, window, "Windows can only be added to ordinary Desktops.");
     NSArray *memberships = nil;
     NSString *display = nil;
-    if ((status = require_desktop_window(before, window, space, &memberships, &display, error))) return status;
+    if ((status = require_desktop_window(before, window, space, false, &memberships, &display, error))) return status;
     if (![target[@"display"] isEqual:display])
         return fail(error, NSK_DIFFERENT_DISPLAYS, space, window, "The window's Desktops are on another display.");
     if ([memberships containsObject:@(space)]) return succeed(error);
