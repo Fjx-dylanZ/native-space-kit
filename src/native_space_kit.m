@@ -34,6 +34,7 @@ static CFTypeRef (*g_queryCopyWindows)(CFTypeRef);
 static bool (*g_iteratorAdvance)(CFTypeRef);
 static uint32_t (*g_iteratorWindowID)(CFTypeRef);
 static uint64_t (*g_iteratorTags)(CFTypeRef);
+static CFArrayRef (*g_copyAssociatedWindows)(int, uint32_t);
 
 // Window server tag set by canJoinAllSpaces and by app-wide assignment.
 static const uint64_t kStickyTag = 0x800;
@@ -352,6 +353,20 @@ static bool fullscreen_guest(NSDictionary *space, nsk_window_id window) {
            integer_number(tile[@"TileWindowID"]) && [tile[@"TileWindowID"] isEqual:owner];
 }
 
+// 1 if the window shares the owner's association group, 0 if not, -1 when the group cannot
+// be read. The group holds AppKit's fullscreen title bar, whose move is ignored, and the
+// owner's sheets, which a move would detach from their window.
+static int window_associated(nsk_window_id window, nsk_window_id owner) {
+    if (!g_copyAssociatedWindows) return -1;
+    NSArray *group = CFBridgingRelease(g_copyAssociatedWindows(g_connection, window));
+    if (![group isKindOfClass:[NSArray class]]) return -1;
+    for (id member in group) {
+        if (!integer_number(member)) return -1;
+        if ([member unsignedLongLongValue] == owner) return 1;
+    }
+    return 0;
+}
+
 static bool can_leave_fullscreen(NSDictionary *source, nsk_window_id window) {
     if (!source || space_type(source) != 4) return false;
     NSArray *displays = CFBridgingRelease(g_copyManagedSpaces(g_connection));
@@ -363,7 +378,7 @@ static bool can_leave_fullscreen(NSDictionary *source, nsk_window_id window) {
         if (![spaces isKindOfClass:[NSArray class]]) return false;
         for (NSDictionary *space in spaces) {
             if ([space isKindOfClass:[NSDictionary class]] && [space[@"id64"] isEqual:source[@"id"]])
-                return fullscreen_guest(space, window);
+                return fullscreen_guest(space, window) && window_associated(window, [space[@"fs_wid"] unsignedIntValue]) == 0;
         }
     }
     return false;
@@ -408,8 +423,9 @@ static int window_sticky(nsk_window_id window) {
     return sticky;
 }
 
-// Moves may also rescue a guest window from a single fullscreen Space. Additions still
-// require ordinary Desktops of one display. Sticky windows cannot be moved or added.
+// Moves may also rescue a guest window from a single fullscreen Space to a Desktop of the same
+// display. Additions still require ordinary Desktops of one display. Sticky windows cannot be
+// moved or added.
 static nsk_status require_desktop_window(NSArray *spaces, nsk_window_id window, nsk_space_id space,
                                          bool allowFullscreenGuest, NSArray **memberships, NSString **display,
                                          nsk_error *error) {
@@ -419,7 +435,12 @@ static nsk_status require_desktop_window(NSArray *spaces, nsk_window_id window, 
     NSString *home = desktop_display(spaces, current);
     if (!home && allowFullscreenGuest && current.count == 1) {
         NSDictionary *source = find_space(spaces, [current[0] unsignedLongLongValue]);
-        if (can_leave_fullscreen(source, window)) home = source[@"display"];
+        if (can_leave_fullscreen(source, window)) {
+            if (!same_display(source, find_space(spaces, space)))
+                return fail(error, NSK_DIFFERENT_DISPLAYS, space, window,
+                            "A window can leave a fullscreen Space only for a Desktop on the same display.");
+            home = source[@"display"];
+        }
     }
     if (!home)
         return fail(error, NSK_UNSUPPORTED_WINDOW, space, window,
@@ -489,6 +510,7 @@ static nsk_status initialize(nsk_error *error) {
     g_iteratorAdvance = dlsym(skylight, "SLSWindowIteratorAdvance");
     g_iteratorWindowID = dlsym(skylight, "SLSWindowIteratorGetWindowID");
     g_iteratorTags = dlsym(skylight, "SLSWindowIteratorGetTags");
+    g_copyAssociatedWindows = dlsym(skylight, "SLSCopyAssociatedWindows");
     if (!mainConnection || !g_copyManagedSpaces) return fail(error, NSK_UNSUPPORTED, 0, 0, "The native Space census APIs are unavailable.");
     g_connection = mainConnection();
     if (!g_connection) return fail(error, NSK_NO_GUI_SESSION, 0, 0, "No window server connection is available.");
