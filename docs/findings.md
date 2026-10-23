@@ -158,13 +158,33 @@ requested window is not that owner. Missing or conflicting owner metadata,
 Split View, mixed memberships, sticky windows, and non-Desktop destinations
 remain refused. `add-window` and process assignments retain their existing guards.
 
+The owner's own helper windows are not guests. `SLSCopyAssociatedWindows(cid,
+wid)` returns the owner, AppKit's fullscreen title-bar window (a 32-point strip
+above the display, level 0, parent 0), and any sheet as one group; ordinary
+windows, panels, and other windows of the same app return only themselves.
+Without this check, moving the title bar was submitted and ignored
+(`not_confirmed`), and moving a sheet detached it onto the other Desktop while
+its fullscreen window stayed behind. The kit refuses any window associated with
+the owner, and refuses every fullscreen guest when the group cannot be read.
+
 The regression was staged with `sticky-probe place` on the actual Siri window
 and an inactive Infuse fullscreen Space, then checked with `observe` before
 and after `move-window`. The fullscreen owner was separately refused before
-dispatch. This verifies same-display membership and compositor hosting; it
-does not establish cross-display moves from fullscreen, Split View, or general
-focus/input isolation. SIP was already disabled and was not changed for this
-test. Pure owner-metadata tests run as part of `make check`.
+dispatch. SIP was already disabled and was not changed for this test.
+
+On macOS 27 (26A428) with SIP enabled, the same `fs_wid`/`TileSpaces` layout
+was read from a fixture app's fullscreen window. A window from another process
+left both the active and an inactive fullscreen Space for an inactive Desktop.
+The current Space did not change, and the owner kept its fullscreen Space and
+frame. A second window and a fullscreen-auxiliary panel of the owner's app also
+moved. The owner, its title bar, and its sheet were refused before dispatch, as
+were `add-window`, a window on both a Desktop and the fullscreen Space, and a
+move into the fullscreen Space.
+
+Guests may only move to a Desktop on the fullscreen Space's display
+(`NSK_DIFFERENT_DISPLAYS` otherwise). Moves across displays, Split View, and
+general focus/input isolation are not established. Pure owner-metadata,
+association, and display tests run as part of `make check`.
 
 ## 6. Reordering (Verified)
 

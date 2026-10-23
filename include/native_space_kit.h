@@ -118,9 +118,11 @@ NSK_EXPORT nsk_status nsk_destroy_space(nsk_space_id space, uint32_t options, ns
  * A window on several Desktops (see nsk_add_window_to_space) ends up on the
  * destination alone. Does not deliberately activate the destination. Sticky windows
  * (canJoinAllSpaces or an app assignment) and windows on system Spaces are refused.
- * A non-owning window on a single fullscreen Space may also move out when its sole
- * fullscreen owner is identifiable. Fullscreen owners, Split View, and unknown owner
- * metadata are refused. Destinations must still be ordinary Desktops.
+ * A non-owning window on a single fullscreen Space may also move out, to a Desktop of the
+ * same display (NSK_DIFFERENT_DISPLAYS otherwise), when its sole fullscreen owner is
+ * identifiable. Fullscreen owners and windows associated with them (title bar, sheets),
+ * Split View, and unknown owner metadata are refused. Destinations must still be
+ * ordinary Desktops.
  */
 NSK_EXPORT nsk_status nsk_move_window(nsk_window_id window, nsk_space_id destination, nsk_error *error);
 
